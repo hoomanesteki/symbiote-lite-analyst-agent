@@ -1,0 +1,34 @@
+name: symbiote-lite
+channels:
+  - conda-forge
+dependencies:
+  #  Python
+  - python=3.11
+
+  #  Core data stack
+  - pandas=2.2.*
+  - numpy=1.26.*
+  - pyarrow=15.*
+
+  #  Google BigQuery
+  - google-cloud-bigquery=3.17.*
+  - google-auth=2.29.*
+
+  #  Visualization (later)
+  - matplotlib=3.8.*
+  - seaborn=0.13.*
+
+  #  ML
+  - scikit-learn=1.4.*
+
+  #  App / UI 
+  - streamlit=1.33.*
+
+  #  Utilities 
+  - pydantic=2.6.*
+  - python-dotenv=1.0.*
+
+  # Pip-only deps
+  - pip
+  - pip:
+      - db-dtypes==1.2.0
