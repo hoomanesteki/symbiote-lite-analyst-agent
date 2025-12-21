@@ -161,6 +161,8 @@ Rules:
 - If user asks for other years (e.g. 2023) => dataset_match=false
 - If user asks about churn/customers/cohorts => dataset_match=false
 - If question is greetings/help/what-can-I-ask/summary/overview => intent="unknown", dataset_match=true
+- If user asks about trips/rides/activity/taxi activity/frequency with time context => intent="trip_frequency"
+- If user mentions "breakdown", "trends", "activity" with trips/taxi => intent="trip_frequency"
 
 Return JSON only.
 """.strip()
@@ -180,7 +182,10 @@ Output JSON ONLY:
 Notes:
 - Keep rewritten short and explicit about dates if user implied (e.g., "summer 2022" -> "2022-06-01 to 2022-09-01")
 - If user says "busier" set intent_hint="trip_frequency"
+- If user says "taxi activity", "trip trends", "breakdown" set intent_hint="trip_frequency"
 - If user says "summary" or "overview", keep rewritten as a helpful suggestion question.
+- Extract month names and convert to dates (e.g., "March vs April" -> "2022-03-01 to 2022-05-01")
+- If user says "whole year" or "all of 2022" -> "2022-01-01 to 2023-01-01"
 Return JSON only.
 """.strip()
 
@@ -197,6 +202,10 @@ def _heuristic_route(user_input: str) -> Dict[str, Any]:
 
     if any(k in t for k in ["help", "what can i ask", "what can i do", "who are you"]):
         return {"intent": "unknown", "dataset_match": True}
+
+    # Enhanced: catch more trip-related queries
+    if any(k in t for k in ["taxi activity", "trip trends", "breakdown", "spot trends", "whole year"]):
+        return {"intent": "trip_frequency", "dataset_match": True}
 
     if "vendor" in t:
         return {"intent": "vendor_inactivity", "dataset_match": True}
@@ -334,7 +343,7 @@ SEASON_MAP = {
 
 def extract_dates(text: str) -> List[datetime]:
     """
-    ENHANCED: Immediate feedback on invalid dates
+    ENHANCED: Immediate feedback on invalid dates + better month extraction
     """
     dates: List[datetime] = []
     invalid_dates: List[str] = []
@@ -365,6 +374,11 @@ def extract_dates(text: str) -> List[datetime]:
 
     t = text.lower()
 
+    # Check for "whole year" or "all of 2022"
+    if any(phrase in t for phrase in ["whole year", "all of 2022", "entire year"]):
+        if "2022" in t or not re.search(r"\b20\d{2}\b", t):
+            return [datetime(2022, 1, 1), datetime(2023, 1, 1)]
+
     # Quarters
     if "2022" in t:
         qm = Q_RE.search(t)
@@ -383,24 +397,33 @@ def extract_dates(text: str) -> List[datetime]:
                 return []
             return [datetime(2022, m1, 1), datetime(2022, m2, 1)]
 
-    # Month words
-    if "2022" not in t:
-        return []
+    # Month words - ENHANCED: better handling
     months = MONTH_RE.findall(t)
-    if not months:
-        return []
+    if months:
+        # Check for comparison patterns like "March vs April" or "March compared to April"
+        if any(word in t for word in [" vs ", " versus ", " compared to ", " compare "]):
+            if len(months) >= 2:
+                nums = [MONTH_MAP[m[:3].lower()] for m in months[:2]]
+                start = datetime(2022, min(nums), 1)
+                end_m = max(nums)
+                end = datetime(2022, end_m + 1, 1) if end_m < 12 else datetime(2023, 1, 1)
+                return [start, end]
+        
+        # If just one or two months mentioned
+        if "2022" in t or not re.search(r"\b20\d{2}\b", t):
+            nums = [MONTH_MAP[m[:3].lower()] for m in months]
+            if len(nums) == 1:
+                m = nums[0]
+                start = datetime(2022, m, 1)
+                end = datetime(2022, m + 1, 1) if m < 12 else datetime(2023, 1, 1)
+                return [start, end]
+            elif len(nums) >= 2:
+                start = datetime(2022, min(nums), 1)
+                end_m = max(nums)
+                end = datetime(2022, end_m + 1, 1) if end_m < 12 else datetime(2023, 1, 1)
+                return [start, end]
 
-    nums = [MONTH_MAP[m[:3].lower()] for m in months]
-    if len(nums) == 1:
-        m = nums[0]
-        start = datetime(2022, m, 1)
-        end = datetime(2022, m + 1, 1) if m < 12 else datetime(2023, 1, 1)
-        return [start, end]
-
-    start = datetime(2022, min(nums), 1)
-    end_m = max(nums)
-    end = datetime(2022, end_m + 1, 1) if end_m < 12 else datetime(2023, 1, 1)
-    return [start, end]
+    return []
 
 def extract_slots_from_text(user_input: str) -> None:
     dates = extract_dates(user_input)
@@ -816,9 +839,8 @@ def run_agent():
             if "busier" in q.lower() or "busy" in q.lower():
                 intent = _clarify_busier()
             else:
-                print("\nI can help with NYC taxi data in 2022.")
-                print("Are you trying to analyze trips, fares, tips, or vendors?")
-                print("Type 'help' to see examples.\n")
+                print("\n❓ I can help with trip analysis, fare analysis, tip analysis, or vendor analysis.")
+                print("Try: \"show trips in January 2022 by week\" or type 'help' for examples.\n")
                 continue
 
         session_state["intent"] = intent
