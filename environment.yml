@@ -1,6 +1,7 @@
 name: symbiote-lite
 channels:
   - conda-forge
+
 dependencies:
   # Python
   - python=3.11
@@ -35,9 +36,12 @@ dependencies:
   # Notebook SQL support
   - sqlalchemy=2.0.*
 
-  # Pip-only deps
+  # Pip itself
   - pip
+
+  # Pip-only packages (cross-platform safe)
   - pip:
+      - openai>=1.40.0
       - db-dtypes==1.2.0
       - ipython-sql==0.5.0
       - altair_ally==0.1.0
