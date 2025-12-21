@@ -1,20 +1,17 @@
 from __future__ import annotations
 """
 Symbiote Lite — Human-in-the-Loop NYC Taxi Analyst (2022)
+ENHANCED VERSION with smart guidance, robust edge case handling, and better UX
 
-- Deterministic slots + validation + safe SQL
-- Human-like guidance (help / summary / clarifications)
-- Optional ChatGPT routing + semantic rewrite layer
-
-Test contract preserved:
-- reset_session() returns dict
-- session_state is dict at module level
-- MODEL exists at module level (tests monkeypatch)
-- ask_gemini_router parses JSON from MODEL.generate_content().text
-- validate_range accepts strings
-- normalize_metric("avg") -> "avg"
-- safe_select_only exists
-- build_sql(intent) works with datetime OR "YYYY-MM-DD" strings
+Improvements:
+- Smarter summary mode (doesn't trigger on specific questions)
+- Immediate invalid date feedback
+- Smart granularity recommendations
+- SQL explanations before approval
+- Better validation and error handling
+- Contextual help system
+- Follow-up suggestions
+- Empty result handling
 """
 
 # =============================================================================
@@ -24,7 +21,7 @@ import os
 import json
 import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple, Optional
 
 try:
@@ -56,8 +53,8 @@ def reset_session() -> Dict[str, Any]:
         "end_date": None,       # datetime OR "YYYY-MM-DD" (exclusive)
         "granularity": None,    # daily / weekly / monthly
         "metric": None,         # avg / total
-        # --- PATCH: tiny UX flags (won't affect tests) ---
-        "_saw_invalid_iso_date": False,   # user typed something like 2022-13-01
+        "_saw_invalid_iso_date": False,
+        "_invalid_dates": [],   # Track which dates were invalid
     }
 
 session_state: Dict[str, Any] = reset_session()
@@ -90,7 +87,7 @@ Data constraints:
 
 Examples:
 - "show trips from 2022-01-01 to 2022-02-01 by day"
-- "were we busier in January vs February 2022?" (I’ll ask what “busier” means)
+- "were we busier in January vs February 2022?" (I'll ask what "busier" means)
 - "how did fares change in summer 2022 by week (avg)"
 - "show total tips in Q2 2022 by month"
 - "which vendors were inactive in November 2022?"
@@ -198,7 +195,7 @@ def _heuristic_route(user_input: str) -> Dict[str, Any]:
     if re.search(r"\b20(1\d|2[0134-9])\b", t) and "2022" not in t:
         return {"intent": "unknown", "dataset_match": False}
 
-    if any(k in t for k in ["help", "what can i ask", "what can i do", "who are you", "overview", "summary", "summar"]):
+    if any(k in t for k in ["help", "what can i ask", "what can i do", "who are you"]):
         return {"intent": "unknown", "dataset_match": True}
 
     if "vendor" in t:
@@ -300,6 +297,11 @@ def validate_range(start: str, end: str) -> None:
         raise ValueError("Date must be in 2022.")
     if e <= s:
         raise ValueError("end_date must be AFTER start_date (end_date is exclusive).")
+    
+    # ENHANCEMENT: Warn about single-day ranges
+    if (e - s).days == 1:
+        print(f"\n💡 Note: This is a single-day range ({s.strftime('%Y-%m-%d')} only).")
+        print("   Remember: end_date is exclusive.\n")
 
 def _date_to_str(d: Any) -> str:
     if isinstance(d, datetime):
@@ -332,24 +334,31 @@ SEASON_MAP = {
 
 def extract_dates(text: str) -> List[datetime]:
     """
-    PATCH:
-    - If the user typed ISO-like dates but ALL were invalid (e.g., 2022-13-01),
-      set session_state["_saw_invalid_iso_date"]=True so CLI can ask to re-enter.
+    ENHANCED: Immediate feedback on invalid dates
     """
     dates: List[datetime] = []
+    invalid_dates: List[str] = []
     found_iso = False
 
     for y, m, d in ISO_DATE_RE.findall(text):
         found_iso = True
         try:
             dt = datetime(int(y), int(m), int(d))
-        except Exception:
-            continue
-        if dt.year == DATASET_YEAR:
-            dates.append(dt)
+            if dt.year == DATASET_YEAR:
+                dates.append(dt)
+        except ValueError:
+            invalid_dates.append(f"{y}-{m}-{d}")
 
-    if found_iso and not dates:
+    # ENHANCEMENT: Immediate feedback
+    if invalid_dates:
+        print(f"\n⚠️  Found invalid date(s): {', '.join(invalid_dates)}")
+        print("    Tip: Month must be 01-12, day must fit the month")
+        print("    Example: 2022-06-15 (June 15th, 2022)\n")
         session_state["_saw_invalid_iso_date"] = True
+        session_state["_invalid_dates"] = invalid_dates
+
+    if found_iso and not dates and invalid_dates:
+        return []
 
     if dates:
         return sorted(dates)
@@ -366,11 +375,13 @@ def extract_dates(text: str) -> List[datetime]:
             end = datetime(2022, start_month + 3, 1)
             return [start, end]
 
-    # Seasons
-    if "2022" in t:
-        for s, (m1, m2) in SEASON_MAP.items():
-            if s in t:
-                return [datetime(2022, m1, 1), datetime(2022, m2, 1)]
+    # Seasons - ENHANCEMENT: ask if year missing
+    for s, (m1, m2) in SEASON_MAP.items():
+        if s in t:
+            if "2022" not in t:
+                print(f"\n💡 I see '{s}' — did you mean {s} 2022?")
+                return []
+            return [datetime(2022, m1, 1), datetime(2022, m2, 1)]
 
     # Month words
     if "2022" not in t:
@@ -476,6 +487,76 @@ ORDER BY 1;
 """.strip()
 
 # =============================================================================
+# ENHANCEMENT: Smart recommendations
+# =============================================================================
+def recommend_granularity(start: datetime, end: datetime) -> str:
+    """Suggest granularity based on date range"""
+    days = (end - start).days
+    
+    if days <= 7:
+        return "daily"
+    elif days <= 90:
+        return "weekly"
+    else:
+        return "monthly"
+
+def estimate_rows(intent: str, start: datetime, end: datetime, granularity: Optional[str]) -> str:
+    """Estimate result rows for user"""
+    if intent == "vendor_inactivity":
+        return "~3-5"
+    
+    if not granularity:
+        return "unknown"
+    
+    days = (end - start).days
+    if granularity == "daily":
+        return f"~{days}"
+    elif granularity == "weekly":
+        return f"~{days // 7}"
+    else:
+        return f"~{days // 30}"
+
+def explain_sql(intent: str) -> str:
+    """Human-readable SQL explanation"""
+    metric = session_state.get("metric")
+    explanations = {
+        "trip_frequency": "Count how many taxi trips occurred in each time bucket",
+        "vendor_inactivity": "Rank taxi vendors by total trips (fewest first = most inactive)",
+        "fare_trend": f"Calculate {'total sum' if metric=='total' else 'average'} of fare amounts per time bucket",
+        "tip_trend": f"Calculate {'total sum' if metric=='total' else 'average'} of tip amounts per time bucket",
+    }
+    return explanations.get(intent, "Run analysis query")
+
+def suggest_followup(intent: str) -> None:
+    """Context-aware follow-up suggestions"""
+    suggestions = {
+        "trip_frequency": [
+            "Compare this to another period",
+            "See which vendors drove these trips",
+            "Check fare trends for the same period",
+        ],
+        "vendor_inactivity": [
+            "See trip trends for the most inactive vendor",
+            "Compare vendor activity across quarters",
+        ],
+        "fare_trend": [
+            "Compare to trip frequency (correlation?)",
+            "See tip trends for the same period",
+        ],
+        "tip_trend": [
+            "Compare to fare trends (tip percentage)",
+            "See which vendors have highest tips",
+        ],
+    }
+    
+    items = suggestions.get(intent, [])
+    if items:
+        print("\n💡 You might also want to:")
+        for i, s in enumerate(items, 1):
+            print(f"   {i}. {s}")
+        print()
+
+# =============================================================================
 # Helpers
 # =============================================================================
 def missing_slots(intent: str) -> List[str]:
@@ -487,6 +568,27 @@ def validate_dates_state() -> None:
     ed = _date_to_str(session_state["end_date"])
     validate_range(sd, ed)
 
+def validate_all_slots() -> bool:
+    """ENHANCEMENT: Final sanity check before SQL"""
+    try:
+        validate_dates_state()
+        
+        intent = session_state["intent"]
+        if intent in ["trip_frequency", "fare_trend", "tip_trend"]:
+            if not session_state.get("granularity"):
+                print("⚠️  Internal error: missing granularity")
+                return False
+        
+        if intent in ["fare_trend", "tip_trend"]:
+            if not session_state.get("metric"):
+                print("⚠️  Internal error: missing metric")
+                return False
+        
+        return True
+    except Exception as e:
+        print(f"⚠️  Validation failed: {e}")
+        return False
+
 def _prompt_choice(prompt: str, choices: List[str], default: Optional[str] = None) -> str:
     while True:
         suffix = f" [{default}]" if default else ""
@@ -496,7 +598,7 @@ def _prompt_choice(prompt: str, choices: List[str], default: Optional[str] = Non
         raw = raw.split()[0] if raw else raw
         if raw in choices:
             return raw
-        print(f"  ⚠️ Choose one: {', '.join(choices)}.")
+        print(f"  ⚠️  Choose one: {', '.join(choices)}.")
 
 def _prompt_yes_no(prompt: str) -> bool:
     while True:
@@ -505,7 +607,7 @@ def _prompt_yes_no(prompt: str) -> bool:
             return True
         if raw in ("no", "n"):
             return False
-        print("  ⚠️ Please type yes or no.")
+        print("  ⚠️  Please type yes or no.")
 
 def _prompt_date(field: str, example: str) -> datetime:
     while True:
@@ -514,10 +616,10 @@ def _prompt_date(field: str, example: str) -> datetime:
             validate_date(raw)
             return _parse_date(raw)
         except Exception as e:
-            print(f"  ⚠️ {e}")
+            print(f"  ⚠️  {e}")
 
 # =============================================================================
-# PATCH: smarter meta + summary handling (NO architecture change)
+# ENHANCEMENT: Smarter meta + guidance handling
 # =============================================================================
 SUMMARY_FUZZY_RE = re.compile(r"\bsumm(?:ary|ar|er|ery|ize|ised|ized)?\b", re.I)
 HELPISH_RE = re.compile(r"\b(help|what can i ask|what can i do|how can you help|how can u help|who are you|your name)\b", re.I)
@@ -525,10 +627,18 @@ HELPISH_RE = re.compile(r"\b(help|what can i ask|what can i do|how can you help|
 def _is_summaryish(text: str) -> bool:
     return bool(SUMMARY_FUZZY_RE.search(text))
 
+def _has_specific_topic(text: str) -> bool:
+    """Check if user mentioned a specific topic"""
+    t = text.lower()
+    return any(word in t for word in ["fare", "fares", "tip", "tips", "trip", "trips", "vendor", "vendors"])
+
+def _needs_summary_wizard(text: str) -> bool:
+    """ENHANCEMENT: Only trigger wizard if vague + summary keyword"""
+    return _is_summaryish(text) and not _has_specific_topic(text)
+
 def _handle_summary_wizard() -> Optional[str]:
     """
     Returns a rewritten analytic question string, or None if user cancels.
-    Minimal UX: guide user into an actionable query.
     """
     print("\n🧾 Summary mode — I can summarize a period, but I need 2 things:")
     print("1) Topic: trips / fares / tips / vendors")
@@ -537,17 +647,16 @@ def _handle_summary_wizard() -> Optional[str]:
     topic = _prompt_choice("Topic (trips/fares/tips/vendors)", ["trips", "fares", "tips", "vendors"], default="trips")
     period = input("Period (example: summer 2022): ").strip()
     if not period:
-        print("  ⚠️ Please provide a period (like 'summer 2022' or '2022-01-01 to 2022-02-01').\n")
+        print("  ⚠️  Please provide a period (like 'summer 2022' or '2022-01-01 to 2022-02-01').\n")
         return None
 
-    # choose a sensible default granularity for summaries
     gran = "monthly"
 
     if topic == "trips":
         return f"show trips in {period} by {gran}"
     if topic == "vendors":
         return f"which vendors were inactive in {period}"
-    # fares/tips: ask metric
+    
     print("\nMetric controls how we aggregate money:")
     print("  - avg   = average per trip")
     print("  - total = total sum in the period")
@@ -556,26 +665,51 @@ def _handle_summary_wizard() -> Optional[str]:
         return f"show {metric} fares in {period} by {gran}"
     return f"show {metric} tips in {period} by {gran}"
 
+def contextual_help(user_input: str) -> None:
+    """ENHANCEMENT: Context-aware help"""
+    t = user_input.lower()
+    
+    if "date" in t or "when" in t:
+        print("\n📅 Date format: YYYY-MM-DD (example: 2022-06-15)")
+        print("Shortcuts:")
+        print("  • 'summer 2022' = June-August")
+        print("  • 'Q2 2022' = April-June")
+        print("  • 'November 2022' = full month\n")
+    elif "granularity" in t:
+        print("\n📊 Granularity = time bucket size:")
+        print("  • daily   = one row per day")
+        print("  • weekly  = one row per week")
+        print("  • monthly = one row per month")
+        print("Use finer granularity for short periods.\n")
+    elif "metric" in t:
+        print("\n💰 Metric = how to aggregate money:")
+        print("  • avg   = average per trip (e.g., $15.23/trip)")
+        print("  • total = sum over all trips (e.g., $50,000 total)")
+        print("Use 'total' to see revenue, 'avg' to see typical amounts.\n")
+    else:
+        print("\n" + HELP_TEXT + "\n")
+
 def _handle_meta_or_guidance(user_input: str) -> Optional[str]:
     """
     Returns:
-    - a rewritten analytic question (string) if we should continue with analytics
-    - "" if handled fully (and should continue loop)
+    - a rewritten analytic question (string) if we should continue
+    - "" if handled fully
     - None if not a meta/guidance input
     """
     t = user_input.strip().lower()
 
-    if t in ("help", "what can i ask", "what can i do"):
-        print("\n" + HELP_TEXT + "\n")
+    if t == "help" or "help" in t:
+        contextual_help(user_input)
         return ""
 
     if HELPISH_RE.search(t):
-        print("\nHi! I’m Symbiote Lite. I help you analyze NYC Yellow Taxi trips in 2022.\n")
+        print("\nHi! I'm Symbiote Lite. I help you analyze NYC Yellow Taxi trips in 2022.\n")
         print("Try: \"show trips from 2022-01-01 to 2022-02-01 by day\"")
         print("Or type 'help' for examples.\n")
         return ""
 
-    if _is_summaryish(t) or "overview" in t:
+    # ENHANCEMENT: Only trigger wizard if truly vague
+    if _needs_summary_wizard(t):
         rewritten = _handle_summary_wizard()
         return rewritten if rewritten else ""
 
@@ -597,7 +731,7 @@ def _clarify_busier() -> str:
         if raw == "3":
             session_state["metric"] = "avg"
             return "fare_trend"
-        print("  ⚠️ Choose 1, 2, or 3.")
+        print("  ⚠️  Choose 1, 2, or 3.")
 
 # =============================================================================
 # CLI loop
@@ -607,14 +741,23 @@ def run_agent():
 
     print("\n" + INTRO + "\n")
 
-    # show mode
+    # Show mode
     if os.getenv("OPENAI_API_KEY"):
         if MODEL is None:
-            print("⚠️ OPENAI_API_KEY is set, but OpenAI client/model is not available. Falling back to deterministic mode.\n")
+            print("⚠️  OPENAI_API_KEY is set, but OpenAI client/model is not available. Falling back to deterministic mode.\n")
         else:
             print("✅ ChatGPT routing is enabled (OpenAI).\n")
     else:
-        print("ℹ️ ChatGPT routing is OFF (no OPENAI_API_KEY). Using deterministic mode.\n")
+        print("ℹ️  ChatGPT routing is OFF (no OPENAI_API_KEY). Using deterministic mode.\n")
+
+    # ENHANCEMENT: First-time user hint
+    if not os.path.exists(".symbiote_history"):
+        print("👋 First time here? Try: \"show trips in January 2022 by week\"\n")
+        try:
+            with open(".symbiote_history", "w") as f:
+                f.write("visited")
+        except Exception:
+            pass
 
     while True:
         q = input("Ask a question: ").strip()
@@ -628,41 +771,40 @@ def run_agent():
             print("Session reset.\n")
             continue
 
-        # --- PATCH: meta/guidance & summary wizard first ---
+        # Meta/guidance & summary wizard first
         meta = _handle_meta_or_guidance(q)
         if meta is not None:
             if meta == "":
-                continue  # fully handled
+                continue
             else:
-                # meta returned a rewritten analytic query
                 q = meta
 
-        # reset per analytic turn (avoid spillover)
+        # Reset per analytic turn
         session_state = reset_session()
 
-        # semantic rewrite (optional)
+        # Semantic rewrite (optional)
         rewrite = semantic_rewrite(q)
         rewritten = (rewrite.get("rewritten") or q).strip()
 
-        # deterministic slots first
+        # ENHANCEMENT: Use LLM hints to pre-fill slots
+        gh = rewrite.get("granularity_hint")
+        if gh and gh in ("daily", "weekly", "monthly"):
+            session_state["granularity"] = gh
+        
+        mh = rewrite.get("metric_hint")
+        if mh and mh in ("avg", "total"):
+            session_state["metric"] = mh
+
+        # Deterministic extraction (adds to LLM hints)
         extract_slots_from_text(rewritten)
 
-        # --- PATCH: if user typed invalid ISO date in question, force clean date re-entry ---
+        # ENHANCEMENT: If invalid dates detected, force clean re-entry
         if session_state.get("_saw_invalid_iso_date"):
-            print("\n  ⚠️ I noticed an invalid date in your question (example mistake: 2022-13-01).")
-            print("  Let’s enter the dates again in YYYY-MM-DD.\n")
+            print("  Let's enter valid dates.\n")
             session_state["start_date"] = None
             session_state["end_date"] = None
 
-        # seed slot hints
-        gh = rewrite.get("granularity_hint")
-        if gh and session_state["granularity"] is None and gh in ("daily", "weekly", "monthly"):
-            session_state["granularity"] = gh
-        mh = rewrite.get("metric_hint")
-        if mh and session_state["metric"] is None and mh in ("avg", "total"):
-            session_state["metric"] = mh
-
-        # route
+        # Route
         route = ask_gemini_router(rewritten)
         if not route.get("dataset_match", True):
             print("\n❌ Out of scope for this dataset (NYC Yellow Taxi 2022).")
@@ -679,20 +821,30 @@ def run_agent():
                 print("Type 'help' to see examples.\n")
                 continue
 
-        # set intent
         session_state["intent"] = intent
 
-        # prompt missing slots
+        # Prompt missing slots
         for slot in missing_slots(intent):
             if slot == "start_date":
                 session_state["start_date"] = _prompt_date("start_date", "2022-06-01")
             elif slot == "end_date":
                 session_state["end_date"] = _prompt_date("end_date", "2022-09-01")
             elif slot == "granularity":
+                # ENHANCEMENT: Smart default
+                if session_state["start_date"] and session_state["end_date"]:
+                    suggestion = recommend_granularity(
+                        session_state["start_date"],
+                        session_state["end_date"]
+                    )
+                    days = (session_state["end_date"] - session_state["start_date"]).days
+                    print(f"\n💡 For a {days}-day range, '{suggestion}' often works well.")
+                else:
+                    suggestion = "weekly"
+                
                 session_state["granularity"] = _prompt_choice(
                     "granularity (daily/weekly/monthly)",
                     ["daily", "weekly", "monthly"],
-                    default="weekly",
+                    default=suggestion,
                 )
             elif slot == "metric":
                 print("\nMetric controls how we aggregate money:")
@@ -704,21 +856,39 @@ def run_agent():
                     default="avg",
                 )
 
-        # validate dates (no silent empty queries)
+        # Validate dates
         try:
             validate_dates_state()
         except Exception as e:
-            print(f"\n  ⚠️ {e}")
-            print("Let’s fix the dates.\n")
+            print(f"\n  ⚠️  {e}")
+            print("Let's fix the dates.\n")
             session_state["start_date"] = _prompt_date("start_date", "2022-06-01")
             session_state["end_date"] = _prompt_date("end_date", "2022-09-01")
             try:
                 validate_dates_state()
             except Exception as e2:
-                print(f"\n  ⚠️ {e2}\nCancelled.\n")
+                print(f"\n  ⚠️  {e2}\nCancelled.\n")
                 continue
 
-        # Plan + confirm
+        # ENHANCEMENT: Final validation
+        if not validate_all_slots():
+            print("Cannot proceed. Please try again.\n")
+            continue
+
+        # ENHANCEMENT: Warn about very long daily ranges
+        if session_state.get("granularity") == "daily":
+            days = (session_state["end_date"] - session_state["start_date"]).days
+            if days > 90:
+                print(f"\n⚠️  Daily granularity for {days} days = many rows.")
+                print("   Consider 'weekly' or 'monthly' for clearer trends.")
+                if not _prompt_yes_no("Continue with daily?"):
+                    session_state["granularity"] = _prompt_choice(
+                        "Choose different granularity",
+                        ["weekly", "monthly"],
+                        default="weekly",
+                    )
+
+        # Enhanced plan display
         sd = _date_to_str(session_state["start_date"])
         ed = _date_to_str(session_state["end_date"])
         gran = session_state.get("granularity")
@@ -731,32 +901,61 @@ def run_agent():
             "tip_trend": f"{'Sum' if metric=='total' else 'Average'} tips over time",
         }[intent]
 
-        print("\n🧠 Plan:")
-        print(f"  • What I’ll do: {what}")
-        print(f"  • Date range: {sd} → {ed} (end exclusive)")
+        rows = estimate_rows(intent, session_state["start_date"], session_state["end_date"], gran)
+
+        print("\n" + "="*60)
+        print("🧠 EXECUTION PLAN")
+        print("="*60)
+        print(f"📌 Task: {what}")
+        print(f"📅 Period: {sd} to {ed} (exclusive)")
         if gran:
-            print(f"  • Granularity: {gran}")
+            print(f"⏱️  Granularity: {gran}")
         if metric and intent in ("fare_trend", "tip_trend"):
-            print(f"  • Metric: {metric}")
+            print(f"📊 Metric: {metric}")
+        print(f"💾 Expected output: {rows} rows")
+        print("="*60 + "\n")
 
         if not _prompt_yes_no("Does this look correct?"):
             print("Cancelled.\n")
             continue
 
+        # ENHANCEMENT: SQL explanation
+        print(f"\n📊 What this query does:")
+        print(f"   {explain_sql(intent)}\n")
+
         sql = safe_select_only(build_sql(intent))
-        print("\nSQL:\n", sql)
+        print("SQL:")
+        print(sql)
+        print()
 
         if not _prompt_yes_no("Run query?"):
             print("Cancelled.\n")
             continue
 
-        df = execute_sql_query(sql)
-        print(df.head())
-
+        # Execute with error handling
+        print("⏳ Running query...")
         try:
-            print(f"\nDone. Returned {len(df)} rows.\n")
-        except Exception:
-            print("\nDone.\n")
+            df = execute_sql_query(sql)
+            print("✅ Query complete!\n")
+        except Exception as e:
+            print(f"\n❌ Query failed: {e}")
+            print("This might be a bug — please report it.\n")
+            continue
+
+        # ENHANCEMENT: Handle empty results
+        if len(df) == 0:
+            print("⚠️  Query returned 0 rows.")
+            print("Possible reasons:")
+            print("  • Date range has no data in the dataset")
+            print("  • Try expanding the date range")
+            print("  • Verify dates are in 2022\n")
+            continue
+
+        print(df.head(20))  # Show more rows
+        print(f"\nDone. Returned {len(df)} rows.\n")
+
+        # ENHANCEMENT: Follow-up suggestions
+        suggest_followup(intent)
 
         session_state = reset_session()
 
