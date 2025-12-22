@@ -1,39 +1,34 @@
 """
-Minimal MCP client test — MCP 1.25.0 compatible (FINAL)
+Minimal MCP client test — FastMCP (manual server)
 
 This proves:
-- MCP server can be launched
-- Tool can be discovered
-- Tool can be called
+- MCP server is reachable
+- Tools can be discovered
+- Tools can be called
 """
 
 import asyncio
-
 from mcp.client.session import ClientSession
-from mcp.client.stdio import stdio_client, Server
+from mcp.client.stdio import stdio_client
 
 
 async def main():
-    # Create Server object (REQUIRED in MCP 1.25.0)
-    server = Server(
-        command=["python", "-m", "scripts.mcp_server_minimal"]
-    )
-
-    async with stdio_client(server) as (read, write):
+    # Connect to already-running FastMCP server
+    async with stdio_client() as (read, write):
         async with ClientSession(read, write) as session:
-            # List tools
-            tools = await session.list_tools()
-            print("TOOLS:", [t.name for t in tools])
 
-            # Call SQL tool
+            tools = await session.list_tools()
+            print("Available tools:")
+            for tool in tools:
+                print("-", tool.name)
+
             result = await session.call_tool(
-                "execute_sql",
-                {
-                    "sql": "SELECT COUNT(*) AS trips FROM taxi_trips"
-                }
+                name="execute_taxi_sql",
+                arguments={"sql": "SELECT 1 AS test"}
             )
 
-            print("RESULT:", result)
+            print("\nTool result:")
+            print(result)
 
 
 if __name__ == "__main__":

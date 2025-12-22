@@ -25,11 +25,22 @@ from .slots import (
 )
 from .sql.safety import detect_sql_injection, safe_select_only
 from .sql.builder import build_sql
-from .sql.executor import execute_sql_query
+# ============================================================
+# MCP INTEGRATION: Import the tool executor instead of direct SQL
+# ============================================================
+from .tools.executor import DirectToolExecutor
+
 from .explain import (
     INTRO, contextual_help, recommend_granularity, estimate_rows,
     explain_sql, suggest_followup, explain_last_result,
 )
+
+# ============================================================
+# MCP INTEGRATION: Create a single tool executor instance
+# All SQL execution goes through this boundary
+# ============================================================
+_tool_executor = DirectToolExecutor()
+
 
 # ----------------------------
 # Unsupported query patterns
@@ -157,6 +168,24 @@ def _clarify_busier(state: Dict[str, Any]) -> Tuple[str, bool]:
             return ("fare_trend", True)
         print("  ⚠️  Choose 1, 2, or 3.")
 
+
+# ============================================================
+# MCP INTEGRATION: Helper function to execute SQL via MCP boundary
+# ============================================================
+def _execute_via_mcp(sql: str):
+    """
+    Execute SQL through the MCP tool boundary.
+    
+    This is the KEY CHANGE that makes the agent MCP-compliant.
+    The agent does NOT directly call execute_sql_query().
+    Instead, it goes through the DirectToolExecutor.
+    """
+    result = _tool_executor.execute_sql(sql)
+    if not result.get("success"):
+        raise RuntimeError("MCP tool execution failed")
+    return result.get("dataframe")
+
+
 def run_agent():
     model = configure_model()
     state: Dict[str, Any] = reset_session()
@@ -171,6 +200,10 @@ def run_agent():
     else:
         print("ℹ️  ChatGPT routing OFF. Using deterministic mode.\n")
 
+    # ============================================================
+    # MCP INTEGRATION: Show that execution goes through MCP
+    # ============================================================
+    print("🔗 MCP Mode: All SQL execution goes through DirectToolExecutor\n")
     print('👋 First time here? Try: "show trips in January 2022 by week"\n')
 
     while True:
@@ -267,7 +300,7 @@ def run_agent():
             tto = state.get("_swapped_to")
             state["_dates_were_swapped"] = False
             if f and tto:
-                print(f"\n🔁 I noticed the dates were reversed ({f} → {tto}). I’ll use {tto} to {f} instead.\n")
+                print(f"\n🔁 I noticed the dates were reversed ({f} → {tto}). I'll use {tto} to {f} instead.\n")
 
         if state.get("_saw_invalid_iso_date"):
             inv = ", ".join(state.get("_invalid_dates") or [])
@@ -410,6 +443,10 @@ def run_agent():
             print(f"📊 Metric: {metric}")
         rows = estimate_rows(state, intent)
         print(f"💾 Expected output: {rows} rows")
+        # ============================================================
+        # MCP INTEGRATION: Show that execution goes through MCP
+        # ============================================================
+        print(f"🔗 Execution: via MCP DirectToolExecutor")
         print("="*60 + "\n")
 
         if not _prompt_yes_no("Does this look correct?"):
@@ -428,10 +465,14 @@ def run_agent():
             print("Cancelled.\n")
             continue
 
-        print("⏳ Running query...")
+        # ============================================================
+        # MCP INTEGRATION: Execute through MCP boundary
+        # THIS IS THE KEY CHANGE - no longer calling execute_sql_query() directly
+        # ============================================================
+        print("⏳ Running query via MCP tool executor...")
         try:
-            df = execute_sql_query(sql)
-            print("✅ Query complete!\n")
+            df = _execute_via_mcp(sql)
+            print("✅ Query complete (executed via MCP)!\n")
         except Exception as e:
             print(f"\n❌ Query failed: {e}")
             print("This might be a bug — please report it.\n")
