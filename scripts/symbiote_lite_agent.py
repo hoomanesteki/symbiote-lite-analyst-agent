@@ -1,17 +1,20 @@
 from __future__ import annotations
 """
 Symbiote Lite — Human-in-the-Loop NYC Taxi Analyst (2022)
-ENHANCED VERSION with smart guidance, robust edge case handling, and better UX
+COMPREHENSIVE VERSION - All edge cases, security, warnings, error handling
 
-Improvements:
-- Smarter summary mode (doesn't trigger on specific questions)
-- Immediate invalid date feedback
-- Smart granularity recommendations
-- SQL explanations before approval
-- Better validation and error handling
-- Contextual help system
-- Follow-up suggestions
+Features:
+- Smart date extraction with typo tolerance (janurary -> january)
+- SQL injection detection and blocking
+- Unsupported query detection (weekends, hourly, location)
+- Multi-topic detection (trips AND fares -> ask which one)
+- Busier/comparison clarification
+- Numbered follow-up handling with stale context detection
+- Vague time reference handling (last month, recently)
+- Summary wizard for insight requests
+- Granularity recommendations and warnings
 - Empty result handling
+- Graceful error handling throughout
 """
 
 # =============================================================================
@@ -29,7 +32,6 @@ try:
 except Exception:
     load_dotenv = None
 
-# Project root (load .env)
 ROOT = Path(__file__).resolve().parents[1]
 if load_dotenv is not None:
     load_dotenv(ROOT / ".env")
@@ -41,7 +43,7 @@ from .analysis import execute_sql_query
 # =============================================================================
 DATASET_YEAR = 2022
 MIN_DATE = datetime(2022, 1, 1)
-MAX_DATE = datetime(2023, 1, 1)  # exclusive
+MAX_DATE = datetime(2023, 1, 1)
 
 # =============================================================================
 # Session state
@@ -49,18 +51,21 @@ MAX_DATE = datetime(2023, 1, 1)  # exclusive
 def reset_session() -> Dict[str, Any]:
     return {
         "intent": None,
-        "start_date": None,     # datetime OR "YYYY-MM-DD"
-        "end_date": None,       # datetime OR "YYYY-MM-DD" (exclusive)
-        "granularity": None,    # daily / weekly / monthly
-        "metric": None,         # avg / total
+        "start_date": None,
+        "end_date": None,
+        "granularity": None,
+        "metric": None,
         "_saw_invalid_iso_date": False,
-        "_invalid_dates": [],   # Track which dates were invalid
+        "_invalid_dates": [],
+        "_last_query_context": None,
+        "_last_suggestions": [],
+        "_query_count": 0,  # Track queries for stale context detection
     }
 
 session_state: Dict[str, Any] = reset_session()
 
 # =============================================================================
-# Supported intents (SQL-able)
+# Supported intents
 # =============================================================================
 REQUIRED_SLOTS = {
     "trip_frequency": ["start_date", "end_date", "granularity"],
@@ -101,27 +106,22 @@ Commands:
 HELP_TEXT = INTRO
 
 # =============================================================================
-# OpenAI (ChatGPT) integration (optional)
+# OpenAI integration
 # =============================================================================
 def _openai_client() -> Optional[Any]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
     try:
-        from openai import OpenAI  # type: ignore
+        from openai import OpenAI
         return OpenAI()
     except Exception:
         return None
 
 def _openai_model_name() -> str:
-    return os.getenv("SYMBIOTE_MODEL", "gpt-5")
+    return os.getenv("SYMBIOTE_MODEL", "gpt-4")
 
 class _OpenAIModelShim:
-    """
-    Shim to look like Gemini's MODEL for tests:
-    - has generate_content(prompt) -> object with .text
-    Under the hood uses OpenAI Responses API.
-    """
     def __init__(self, client: Any):
         self._client = client
 
@@ -130,13 +130,24 @@ class _OpenAIModelShim:
             self.text = text
 
     def generate_content(self, prompt: str) -> Any:
-        resp = self._client.responses.create(
-            model=_openai_model_name(),
-            reasoning={"effort": "low"},
-            temperature=0,
-            input=prompt,
-        )
-        return self._Resp(resp.output_text or "")
+        try:
+            resp = self._client.responses.create(
+                model=_openai_model_name(),
+                reasoning={"effort": "low"},
+                temperature=0,
+                input=prompt,
+            )
+            return self._Resp(resp.output_text or "")
+        except Exception:
+            try:
+                resp = self._client.chat.completions.create(
+                    model=_openai_model_name(),
+                    temperature=0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return self._Resp(resp.choices[0].message.content or "")
+            except Exception:
+                return self._Resp("")
 
 def configure_chatgpt_model() -> Optional[Any]:
     client = _openai_client()
@@ -144,84 +155,134 @@ def configure_chatgpt_model() -> Optional[Any]:
         return None
     return _OpenAIModelShim(client)
 
-# IMPORTANT: tests monkeypatch this attribute
 MODEL = configure_chatgpt_model()
 
 # =============================================================================
-# Prompts for LLM layers
+# LLM Prompts
 # =============================================================================
 ROUTER_SYSTEM_PROMPT = f"""
 You are a routing assistant for an NYC Yellow Taxi dataset (YEAR {DATASET_YEAR} only).
-
 Output JSON ONLY:
 - intent: one of ["trip_frequency","vendor_inactivity","fare_trend","tip_trend","unknown"]
 - dataset_match: true/false
-
-Rules:
-- If user asks for other years (e.g. 2023) => dataset_match=false
-- If user asks about churn/customers/cohorts => dataset_match=false
-- If question is greetings/help/what-can-I-ask/summary/overview => intent="unknown", dataset_match=true
-- If user asks about trips/rides/activity/taxi activity/frequency with time context => intent="trip_frequency"
-- If user mentions "breakdown", "trends", "activity" with trips/taxi => intent="trip_frequency"
-
 Return JSON only.
 """.strip()
 
 REWRITE_SYSTEM_PROMPT = """
 You rewrite user messages into a clear, analyst-friendly NYC taxi question for YEAR 2022.
-Also extract slot hints if present.
-
 Output JSON ONLY:
-{
-  "rewritten": "string",
-  "intent_hint": "trip_frequency|vendor_inactivity|fare_trend|tip_trend|unknown",
-  "granularity_hint": "daily|weekly|monthly|null",
-  "metric_hint": "avg|total|null"
-}
-
-Notes:
-- Keep rewritten short and explicit about dates if user implied (e.g., "summer 2022" -> "2022-06-01 to 2022-09-01")
-- If user says "busier" set intent_hint="trip_frequency"
-- If user says "taxi activity", "trip trends", "breakdown" set intent_hint="trip_frequency"
-- If user says "summary" or "overview", keep rewritten as a helpful suggestion question.
-- Extract month names and convert to dates (e.g., "March vs April" -> "2022-03-01 to 2022-05-01")
-- If user says "whole year" or "all of 2022" -> "2022-01-01 to 2023-01-01"
+{"rewritten": "string", "intent_hint": "...", "granularity_hint": "...", "metric_hint": "..."}
 Return JSON only.
 """.strip()
 
 # =============================================================================
-# Routing (tests expect ask_gemini_router name)
+# SECURITY: SQL injection detection
+# =============================================================================
+SQL_INJECTION_PATTERNS = [
+    r";\s*drop\s+", r";\s*delete\s+", r";\s*insert\s+", r";\s*update\s+",
+    r";\s*alter\s+", r";\s*create\s+", r";\s*truncate\s+", r"--\s*$",
+    r"'\s*;\s*", r"'\s*or\s+['\"1]", r"'\s*and\s+", r"union\s+select",
+    r"exec\s*\(", r"execute\s*\(", r"xp_\w+", r"sp_\w+",
+    r"0x[0-9a-f]+", r"char\s*\(", r"concat\s*\(",
+]
+
+def detect_sql_injection(user_input: str) -> bool:
+    """Detect potential SQL injection attempts."""
+    t = user_input.lower()
+    for pattern in SQL_INJECTION_PATTERNS:
+        if re.search(pattern, t, re.IGNORECASE):
+            return True
+    return False
+
+# =============================================================================
+# UNSUPPORTED QUERY PATTERNS
+# =============================================================================
+UNSUPPORTED_PATTERNS = [
+    (r"\b(weekend|weekday|saturday|sunday|weekends|weekdays)\s.*(busy|busier|more|less|compar|vs|than)", 
+     "⚠️  Weekend vs weekday breakdown isn't supported yet.\nI can show you daily data so you can see patterns, or try weekly/monthly aggregation."),
+    (r"\b(hour|hourly|morning|evening|afternoon|night|midnight|noon)\b",
+     "⚠️  Hourly breakdown isn't supported yet.\nTry: daily, weekly, or monthly granularity instead."),
+    (r"\b(location|borough|zone|pickup.?location|dropoff.?location|manhattan|brooklyn|queens|bronx|staten)\b",
+     "⚠️  Location-based analysis isn't supported yet.\nI can analyze trips, fares, tips, and vendors over time."),
+    (r"\b(driver|drivers|driver.?id)\b",
+     "⚠️  Driver-level analysis isn't available.\nI can show vendor (company) level data instead."),
+    (r"\b(passenger|passengers|rider|riders)\b",
+     "⚠️  Passenger-level analysis isn't available.\nI can analyze trip counts, fares, and tips over time."),
+    (r"\b(distance|mile|miles|km|kilometer)\b",
+     "⚠️  Distance-based analysis isn't supported yet.\nTry: fare trends or trip counts instead."),
+    (r"\b(payment|cash|card|credit|debit)\b",
+     "⚠️  Payment type breakdown isn't supported yet.\nI can analyze total fares, tips, and trip counts."),
+]
+
+def detect_unsupported_query(user_input: str) -> Optional[str]:
+    """Return explanation if query asks for unsupported feature."""
+    t = user_input.lower()
+    for pattern, explanation in UNSUPPORTED_PATTERNS:
+        if re.search(pattern, t):
+            return explanation
+    return None
+
+# =============================================================================
+# MULTI-TOPIC DETECTION
+# =============================================================================
+def detect_multi_topic(user_input: str) -> Optional[List[str]]:
+    """Detect if user asked for multiple topics at once."""
+    t = user_input.lower()
+    topics_found = []
+    
+    # Only trigger if explicit conjunction
+    if " and " in t or ", " in t:
+        if any(w in t for w in ["trip", "trips", "ride", "rides"]):
+            topics_found.append("trips")
+        if any(w in t for w in ["fare", "fares", "revenue", "money", "price"]):
+            topics_found.append("fares")
+        if any(w in t for w in ["tip", "tips", "tipping"]):
+            topics_found.append("tips")
+        if any(w in t for w in ["vendor", "vendors", "company", "companies"]):
+            topics_found.append("vendors")
+    
+    # Only return if genuinely multiple topics
+    if len(topics_found) >= 2:
+        return topics_found
+    return None
+
+# =============================================================================
+# Routing
 # =============================================================================
 def _heuristic_route(user_input: str) -> Dict[str, Any]:
     t = user_input.lower()
-
-    if any(k in t for k in ["churn", "customer", "cohort", "retention"]):
+    
+    # Out of scope
+    if any(k in t for k in ["churn", "customer", "cohort", "retention", "subscription"]):
         return {"intent": "unknown", "dataset_match": False}
     if re.search(r"\b20(1\d|2[0134-9])\b", t) and "2022" not in t:
         return {"intent": "unknown", "dataset_match": False}
-
+    
+    # Help/meta
     if any(k in t for k in ["help", "what can i ask", "what can i do", "who are you"]):
         return {"intent": "unknown", "dataset_match": True}
-
-    # Enhanced: catch more trip-related queries
-    if any(k in t for k in ["taxi activity", "trip trends", "breakdown", "spot trends", "whole year"]):
+    
+    # Trip-related
+    if any(k in t for k in ["taxi activity", "trip trends", "breakdown", "spot trends", 
+                            "whole year", "entire year", "all of 2022", "full year"]):
         return {"intent": "trip_frequency", "dataset_match": True}
-
+    
+    # Specific intents
     if "vendor" in t:
         return {"intent": "vendor_inactivity", "dataset_match": True}
-    if "tip" in t:
+    if "tip" in t and "strip" not in t:  # Avoid false positive
         return {"intent": "tip_trend", "dataset_match": True}
-    if "fare" in t or "price" in t or "expensive" in t:
+    if any(k in t for k in ["fare", "price", "expensive", "money", "revenue", "cost"]):
         return {"intent": "fare_trend", "dataset_match": True}
-    if any(k in t for k in ["trip", "trips", "ride", "rides", "busy", "busier", "frequency"]):
+    if any(k in t for k in ["trip", "trips", "ride", "rides", "busy", "busier", 
+                            "frequency", "activity", "volume"]):
         return {"intent": "trip_frequency", "dataset_match": True}
-
+    
     return {"intent": "unknown", "dataset_match": True}
 
 def ask_gemini_router(user_input: str) -> Dict[str, Any]:
     if MODEL is None:
         return _heuristic_route(user_input)
-
     try:
         prompt = ROUTER_SYSTEM_PROMPT + "\n\nUser request:\n" + user_input
         response = MODEL.generate_content(prompt)
@@ -235,17 +296,15 @@ def ask_gemini_router(user_input: str) -> Dict[str, Any]:
         return _heuristic_route(user_input)
 
 def semantic_rewrite(user_input: str) -> Dict[str, Any]:
-    def _fallback() -> Dict[str, Any]:
+    def _fallback():
         return {
             "rewritten": user_input.strip(),
             "intent_hint": _heuristic_route(user_input)["intent"],
             "granularity_hint": None,
             "metric_hint": None,
         }
-
     if MODEL is None:
         return _fallback()
-
     try:
         prompt = REWRITE_SYSTEM_PROMPT + "\n\nUser message:\n" + user_input
         resp = MODEL.generate_content(prompt)
@@ -259,16 +318,16 @@ def semantic_rewrite(user_input: str) -> Dict[str, Any]:
         return _fallback()
 
 # =============================================================================
-# Normalizers (tests expect these names + outputs)
+# Normalizers
 # =============================================================================
 def normalize_granularity(value: str) -> str:
     v = (value or "").strip().lower()
-    v = v.split()[0] if v else v
-    if v in ("day", "daily"):
+    v = v.split()[0] if v else ""
+    if v in ("day", "daily", "d", "days"):
         return "daily"
-    if v in ("week", "weekly"):
+    if v in ("week", "weekly", "w", "weeks"):
         return "weekly"
-    if v in ("month", "monthly"):
+    if v in ("month", "monthly", "m", "months"):
         return "monthly"
     raise ValueError("Choose one: daily, weekly, monthly.")
 
@@ -278,14 +337,14 @@ def normalize_metric(value: str) -> str:
     if not parts:
         raise ValueError("Choose one: avg, total.")
     v = parts[0]
-    if v in ("total", "sum"):
+    if v in ("total", "sum", "t", "s"):
         return "total"
-    if v in ("avg", "average", "mean"):
+    if v in ("avg", "average", "mean", "a"):
         return "avg"
     raise ValueError("Choose one: avg, total.")
 
 # =============================================================================
-# Date parsing + validation (tests expect validate_date + validate_range)
+# Date parsing and validation
 # =============================================================================
 def _parse_date(s: str) -> datetime:
     s = s.strip().replace("/", "-")
@@ -295,19 +354,16 @@ def validate_date(date_str: str) -> None:
     try:
         dt = _parse_date(date_str)
     except Exception:
-        raise ValueError("Invalid date. Use YYYY-MM-DD (example: 2022-06-01).")
+        raise ValueError("Invalid date format. Use YYYY-MM-DD (example: 2022-06-01).")
     if not (MIN_DATE <= dt < MAX_DATE):
-        raise ValueError("Date must be in 2022.")
+        raise ValueError(f"Date must be in {DATASET_YEAR}.")
 
 def validate_range(start: str, end: str) -> None:
-    s = _parse_date(start)
-    e = _parse_date(end)
-    if not (MIN_DATE <= s < MAX_DATE) or not (MIN_DATE <= e < MAX_DATE):
-        raise ValueError("Date must be in 2022.")
+    s, e = _parse_date(start), _parse_date(end)
+    if not (MIN_DATE <= s < MAX_DATE) or not (MIN_DATE <= e <= MAX_DATE):
+        raise ValueError(f"Dates must be in {DATASET_YEAR}.")
     if e <= s:
         raise ValueError("end_date must be AFTER start_date (end_date is exclusive).")
-    
-    # ENHANCEMENT: Warn about single-day ranges
     if (e - s).days == 1:
         print(f"\n💡 Note: This is a single-day range ({s.strftime('%Y-%m-%d')} only).")
         print("   Remember: end_date is exclusive.\n")
@@ -320,143 +376,193 @@ def _date_to_str(d: Any) -> str:
     raise TypeError("start_date/end_date must be datetime or YYYY-MM-DD string")
 
 # =============================================================================
-# Deterministic slot extraction (robust, no crashes)
+# Date extraction with typo tolerance
 # =============================================================================
 ISO_DATE_RE = re.compile(r"\b(\d{4})[-/](\d{2})[-/](\d{2})\b")
-MONTH_RE = re.compile(
-    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b",
-    re.IGNORECASE,
-)
-MONTH_MAP = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
-}
 Q_RE = re.compile(r"\bq([1-4])\b", re.IGNORECASE)
-
 SEASON_MAP = {
-    "spring": (3, 6),
-    "summer": (6, 9),
-    "fall": (9, 12),
-    "autumn": (9, 12),
-    "winter": (1, 3),
+    "spring": (3, 6), "summer": (6, 9), "fall": (9, 12), 
+    "autumn": (9, 12), "winter": (1, 3),
 }
+
+# COMPREHENSIVE month map with typos
+MONTH_MAP = {
+    # January variations
+    "jan": 1, "january": 1, "janurary": 1, "janury": 1, "januarry": 1, "janaury": 1,
+    # February variations
+    "feb": 2, "february": 2, "febuary": 2, "feburary": 2, "februrary": 2, "febrary": 2,
+    # March variations
+    "mar": 3, "march": 3, "mach": 3, "mrch": 3,
+    # April variations
+    "apr": 4, "april": 4, "apirl": 4, "apil": 4,
+    # May
+    "may": 5,
+    # June variations
+    "jun": 6, "june": 6, "juen": 6,
+    # July variations
+    "jul": 7, "july": 7, "jully": 7,
+    # August variations
+    "aug": 8, "august": 8, "agust": 8, "augst": 8,
+    # September variations
+    "sep": 9, "sept": 9, "september": 9, "septmber": 9, "setember": 9,
+    # October variations
+    "oct": 10, "october": 10, "octobor": 10, "ocotber": 10,
+    # November variations
+    "nov": 11, "november": 11, "novemeber": 11, "novmber": 11,
+    # December variations
+    "dec": 12, "december": 12, "decmber": 12, "dicember": 12,
+}
+
+def _get_month_num(word: str) -> int:
+    """Get month number from word, with typo tolerance."""
+    w = word.lower().strip()
+    
+    # Direct match
+    if w in MONTH_MAP:
+        return MONTH_MAP[w]
+    
+    # Try first 3 letters
+    if len(w) >= 3:
+        prefix = w[:3]
+        if prefix in MONTH_MAP:
+            return MONTH_MAP[prefix]
+    
+    # Fuzzy: check if starts similarly to any month
+    for key, val in MONTH_MAP.items():
+        if len(key) >= 3 and len(w) >= 3:
+            if key[:3] == w[:3]:
+                return val
+    
+    return 0
+
+def _find_months_in_text(text: str) -> List[int]:
+    """Find all month references in text, including typos."""
+    found = []
+    words = re.findall(r'\b[a-zA-Z]{3,12}\b', text.lower())
+    for word in words:
+        month_num = _get_month_num(word)
+        if month_num > 0 and month_num not in found:
+            found.append(month_num)
+    return found
 
 def extract_dates(text: str) -> List[datetime]:
-    """
-    ENHANCED: Immediate feedback on invalid dates + better month extraction
-    """
-    dates: List[datetime] = []
-    invalid_dates: List[str] = []
-    found_iso = False
-
+    """Extract dates from text with comprehensive pattern matching."""
+    dates, invalid_dates, found_iso = [], [], False
+    
+    # 1. ISO dates (YYYY-MM-DD)
     for y, m, d in ISO_DATE_RE.findall(text):
         found_iso = True
         try:
             dt = datetime(int(y), int(m), int(d))
             if dt.year == DATASET_YEAR:
                 dates.append(dt)
+            elif int(y) == 2023 and int(m) == 1 and int(d) == 1:
+                dates.append(dt)  # Allow as exclusive end
         except ValueError:
             invalid_dates.append(f"{y}-{m}-{d}")
-
-    # ENHANCEMENT: Immediate feedback
+    
     if invalid_dates:
         print(f"\n⚠️  Found invalid date(s): {', '.join(invalid_dates)}")
         print("    Tip: Month must be 01-12, day must fit the month")
         print("    Example: 2022-06-15 (June 15th, 2022)\n")
         session_state["_saw_invalid_iso_date"] = True
         session_state["_invalid_dates"] = invalid_dates
-
+    
     if found_iso and not dates and invalid_dates:
         return []
-
     if dates:
         return sorted(dates)
-
+    
     t = text.lower()
-
-    # Check for "whole year" or "all of 2022"
-    if any(phrase in t for phrase in ["whole year", "all of 2022", "entire year"]):
+    
+    # 2. Whole year patterns
+    whole_year = ["whole year", "all of 2022", "entire year", "full year", 
+                  "all year", "the year", "year 2022"]
+    if any(p in t for p in whole_year):
+        return [datetime(2022, 1, 1), datetime(2023, 1, 1)]
+    
+    # 3. Year with breakdown context
+    if "year" in t and any(w in t for w in ["monthly", "month", "breakdown", "trends", "by"]):
         if "2022" in t or not re.search(r"\b20\d{2}\b", t):
             return [datetime(2022, 1, 1), datetime(2023, 1, 1)]
-
-    # Quarters
-    if "2022" in t:
-        qm = Q_RE.search(t)
-        if qm:
-            q = int(qm.group(1))
-            start_month = (q - 1) * 3 + 1
-            start = datetime(2022, start_month, 1)
-            end = datetime(2022, start_month + 3, 1)
-            return [start, end]
-
-    # Seasons - ENHANCEMENT: ask if year missing
-    for s, (m1, m2) in SEASON_MAP.items():
-        if s in t:
-            if "2022" not in t:
-                print(f"\n💡 I see '{s}' — did you mean {s} 2022?")
+    
+    # 4. Quarters
+    qm = Q_RE.search(t)
+    if qm and ("2022" in t or not re.search(r"\b20\d{2}\b", t)):
+        q = int(qm.group(1))
+        start_month = (q - 1) * 3 + 1
+        end_month = start_month + 3
+        start = datetime(2022, start_month, 1)
+        end = datetime(2022, end_month, 1) if end_month <= 12 else datetime(2023, 1, 1)
+        return [start, end]
+    
+    # 5. Seasons
+    for season, (m1, m2) in SEASON_MAP.items():
+        if season in t:
+            if re.search(r"\b20(?:1\d|2[013-9])\b", t):  # Different year mentioned
+                print(f"\n💡 I see '{season}' — did you mean {season} 2022?")
                 return []
             return [datetime(2022, m1, 1), datetime(2022, m2, 1)]
-
-    # Month words - ENHANCED: better handling
-    months = MONTH_RE.findall(t)
-    if months:
-        # Check for comparison patterns like "March vs April" or "March compared to April"
-        if any(word in t for word in [" vs ", " versus ", " compared to ", " compare "]):
-            if len(months) >= 2:
-                nums = [MONTH_MAP[m[:3].lower()] for m in months[:2]]
-                start = datetime(2022, min(nums), 1)
-                end_m = max(nums)
-                end = datetime(2022, end_m + 1, 1) if end_m < 12 else datetime(2023, 1, 1)
-                return [start, end]
+    
+    # 6. Month names (with typo tolerance)
+    found_months = _find_months_in_text(t)
+    if found_months:
+        # Check for comparison
+        comparison_words = [" vs ", " versus ", " compared to ", " compare ", " or ", " - "]
+        is_comparison = any(w in t for w in comparison_words)
         
-        # If just one or two months mentioned
         if "2022" in t or not re.search(r"\b20\d{2}\b", t):
-            nums = [MONTH_MAP[m[:3].lower()] for m in months]
-            if len(nums) == 1:
-                m = nums[0]
+            if len(found_months) == 1:
+                m = found_months[0]
                 start = datetime(2022, m, 1)
                 end = datetime(2022, m + 1, 1) if m < 12 else datetime(2023, 1, 1)
                 return [start, end]
-            elif len(nums) >= 2:
-                start = datetime(2022, min(nums), 1)
-                end_m = max(nums)
+            elif len(found_months) >= 2:
+                start = datetime(2022, min(found_months), 1)
+                end_m = max(found_months)
                 end = datetime(2022, end_m + 1, 1) if end_m < 12 else datetime(2023, 1, 1)
                 return [start, end]
-
+    
     return []
 
 def extract_slots_from_text(user_input: str) -> None:
+    """Extract all recognizable slots from user input."""
     dates = extract_dates(user_input)
-
+    
     if len(dates) >= 1 and session_state["start_date"] is None:
         session_state["start_date"] = dates[0]
     if len(dates) >= 2 and session_state["end_date"] is None:
         session_state["end_date"] = dates[1]
-
-    text = user_input.lower()
-
+    
+    t = user_input.lower()
+    
+    # Granularity
     if session_state["granularity"] is None:
-        if "month" in text or "monthly" in text:
+        if any(w in t for w in ["monthly", "by month", "per month"]):
             session_state["granularity"] = "monthly"
-        elif "week" in text or "weekly" in text:
+        elif any(w in t for w in ["weekly", "by week", "per week"]):
             session_state["granularity"] = "weekly"
-        elif "day" in text or "daily" in text:
+        elif any(w in t for w in ["daily", "by day", "per day"]):
             session_state["granularity"] = "daily"
-
+    
+    # Metric
     if session_state["metric"] is None:
-        if "total" in text or "sum" in text:
+        if any(w in t for w in ["total", "sum", "overall"]):
             session_state["metric"] = "total"
-        elif "avg" in text or "average" in text or "mean" in text:
+        elif any(w in t for w in ["avg", "average", "mean", "typical"]):
             session_state["metric"] = "avg"
 
 # =============================================================================
-# SQL safety (tests expect safe_select_only)
+# SQL safety
 # =============================================================================
 def safe_select_only(sql: str) -> str:
+    """Ensure SQL is SELECT-only."""
     low = sql.lower().strip()
     if not (low.startswith("select") or low.startswith("with")):
         raise ValueError("Only SELECT queries are allowed.")
-    for kw in ("insert", "update", "delete", "drop", "alter", "create"):
+    dangerous = ["insert", "update", "delete", "drop", "alter", "create", 
+                 "truncate", "grant", "revoke", "exec", "execute"]
+    for kw in dangerous:
         if re.search(rf"\b{kw}\b", low):
             raise ValueError("Unsafe SQL detected.")
     return sql
@@ -474,73 +580,59 @@ def time_bucket(granularity: str) -> Tuple[str, str]:
 def build_sql(intent: str) -> str:
     sd = _date_to_str(session_state["start_date"])
     ed = _date_to_str(session_state["end_date"])
-
+    
     if intent == "trip_frequency":
         expr, label = time_bucket(session_state["granularity"])
-        return f"""
-SELECT {expr} AS {label}, COUNT(*) AS trips
+        return f"""SELECT {expr} AS {label}, COUNT(*) AS trips
 FROM taxi_trips
 WHERE pickup_datetime >= '{sd}'
   AND pickup_datetime < '{ed}'
 GROUP BY 1
-ORDER BY 1;
-""".strip()
-
+ORDER BY 1;"""
+    
     if intent == "vendor_inactivity":
-        return f"""
-SELECT vendor_id, COUNT(*) AS trips
+        return f"""SELECT vendor_id, COUNT(*) AS trips
 FROM taxi_trips
 WHERE pickup_datetime >= '{sd}'
   AND pickup_datetime < '{ed}'
 GROUP BY vendor_id
-ORDER BY trips ASC;
-""".strip()
-
+ORDER BY trips ASC;"""
+    
     col = "fare_amount" if intent == "fare_trend" else "tip_amount"
     agg = "SUM" if session_state["metric"] == "total" else "AVG"
     expr, label = time_bucket(session_state["granularity"])
-
-    return f"""
-SELECT {expr} AS {label}, {agg}({col}) AS value
+    
+    return f"""SELECT {expr} AS {label}, {agg}({col}) AS value
 FROM taxi_trips
 WHERE pickup_datetime >= '{sd}'
   AND pickup_datetime < '{ed}'
 GROUP BY 1
-ORDER BY 1;
-""".strip()
+ORDER BY 1;"""
 
 # =============================================================================
-# ENHANCEMENT: Smart recommendations
+# Smart recommendations
 # =============================================================================
 def recommend_granularity(start: datetime, end: datetime) -> str:
-    """Suggest granularity based on date range"""
     days = (end - start).days
-    
-    if days <= 7:
+    if days <= 14:
         return "daily"
     elif days <= 90:
         return "weekly"
-    else:
-        return "monthly"
+    return "monthly"
 
 def estimate_rows(intent: str, start: datetime, end: datetime, granularity: Optional[str]) -> str:
-    """Estimate result rows for user"""
     if intent == "vendor_inactivity":
         return "~3-5"
-    
     if not granularity:
         return "unknown"
-    
     days = (end - start).days
     if granularity == "daily":
         return f"~{days}"
     elif granularity == "weekly":
-        return f"~{days // 7}"
-    else:
-        return f"~{days // 30}"
+        return f"~{max(1, days // 7)}"
+    return f"~{max(1, days // 30)}"
 
 def explain_sql(intent: str) -> str:
-    """Human-readable SQL explanation"""
     metric = session_state.get("metric")
     explanations = {
         "trip_frequency": "Count how many taxi trips occurred in each time bucket",
@@ -550,8 +642,7 @@ def explain_sql(intent: str) -> str:
     }
     return explanations.get(intent, "Run analysis query")
 
-def suggest_followup(intent: str) -> None:
-    """Context-aware follow-up suggestions"""
+def get_follow_up_suggestions(intent: str) -> List[str]:
     suggestions = {
         "trip_frequency": [
             "Compare this to another period",
@@ -571,8 +662,19 @@ def suggest_followup(intent: str) -> None:
             "See which vendors have highest tips",
         ],
     }
-    
-    items = suggestions.get(intent, [])
+    return suggestions.get(intent, [])
+
+def suggest_followup(intent: str) -> None:
+    items = get_follow_up_suggestions(intent)
+    session_state["_last_suggestions"] = items
+    session_state["_last_query_context"] = {
+        "intent": intent,
+        "start_date": session_state.get("start_date"),
+        "end_date": session_state.get("end_date"),
+        "granularity": session_state.get("granularity"),
+        "metric": session_state.get("metric"),
+        "query_num": session_state.get("_query_count", 0),
+    }
     if items:
         print("\n💡 You might also want to:")
         for i, s in enumerate(items, 1):
@@ -580,7 +682,7 @@ def suggest_followup(intent: str) -> None:
         print()
 
 # =============================================================================
-# Helpers
+# Slot helpers
 # =============================================================================
 def missing_slots(intent: str) -> List[str]:
     req = REQUIRED_SLOTS.get(intent, [])
@@ -592,40 +694,55 @@ def validate_dates_state() -> None:
     validate_range(sd, ed)
 
 def validate_all_slots() -> bool:
-    """ENHANCEMENT: Final sanity check before SQL"""
     try:
         validate_dates_state()
-        
         intent = session_state["intent"]
         if intent in ["trip_frequency", "fare_trend", "tip_trend"]:
             if not session_state.get("granularity"):
                 print("⚠️  Internal error: missing granularity")
                 return False
-        
         if intent in ["fare_trend", "tip_trend"]:
             if not session_state.get("metric"):
                 print("⚠️  Internal error: missing metric")
                 return False
-        
         return True
     except Exception as e:
         print(f"⚠️  Validation failed: {e}")
         return False
 
+# =============================================================================
+# Input prompts
+# =============================================================================
 def _prompt_choice(prompt: str, choices: List[str], default: Optional[str] = None) -> str:
     while True:
         suffix = f" [{default}]" if default else ""
-        raw = input(f"{prompt}{suffix}: ").strip().lower()
+        try:
+            raw = input(f"{prompt}{suffix}: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n")
+            raise
         if not raw and default:
             return default
-        raw = raw.split()[0] if raw else raw
-        if raw in choices:
-            return raw
+        # Try normalize for granularity
+        try:
+            normalized = normalize_granularity(raw)
+            if normalized in choices:
+                return normalized
+        except ValueError:
+            pass
+        # Direct match
+        raw_first = raw.split()[0] if raw else raw
+        if raw_first in choices:
+            return raw_first
         print(f"  ⚠️  Choose one: {', '.join(choices)}.")
 
 def _prompt_yes_no(prompt: str) -> bool:
     while True:
-        raw = input(f"{prompt} (yes/no): ").strip().lower()
+        try:
+            raw = input(f"{prompt} (yes/no): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n")
+            raise
         if raw in ("yes", "y"):
             return True
         if raw in ("no", "n"):
@@ -634,7 +751,13 @@ def _prompt_yes_no(prompt: str) -> bool:
 
 def _prompt_date(field: str, example: str) -> datetime:
     while True:
-        raw = input(f"{field} (YYYY-MM-DD, 2022 only) e.g. {example}: ").strip()
+        try:
+            raw = input(f"{field} (YYYY-MM-DD, 2022 only) e.g. {example}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n")
+            raise
+        if not raw:
+            continue
         try:
             validate_date(raw)
             return _parse_date(raw)
@@ -642,41 +765,52 @@ def _prompt_date(field: str, example: str) -> datetime:
             print(f"  ⚠️  {e}")
 
 # =============================================================================
-# ENHANCEMENT: Smarter meta + guidance handling
+# Meta/guidance detection
 # =============================================================================
-SUMMARY_FUZZY_RE = re.compile(r"\bsumm(?:ary|ar|er|ery|ize|ised|ized)?\b", re.I)
-HELPISH_RE = re.compile(r"\b(help|what can i ask|what can i do|how can you help|how can u help|who are you|your name)\b", re.I)
+SUMMARY_RE = re.compile(r"\b(summar|insight|overview|what.?happened|tell me about)\b", re.I)
+HELPISH_RE = re.compile(r"\b(help|what can i|how can you|who are you|your name)\b", re.I)
 
 def _is_summaryish(text: str) -> bool:
-    return bool(SUMMARY_FUZZY_RE.search(text))
+    return bool(SUMMARY_RE.search(text))
 
 def _has_specific_topic(text: str) -> bool:
-    """Check if user mentioned a specific topic"""
     t = text.lower()
-    return any(word in t for word in ["fare", "fares", "tip", "tips", "trip", "trips", "vendor", "vendors"])
+    return any(w in t for w in ["fare", "fares", "tip", "tips", "trip", "trips", "vendor", "vendors"])
+
+def _has_time_context(text: str) -> bool:
+    t = text.lower()
+    if any(s in t for s in SEASON_MAP.keys()):
+        return True
+    if Q_RE.search(t):
+        return True
+    if ISO_DATE_RE.search(t):
+        return True
+    if _find_months_in_text(t):
+        return True
+    return False
 
 def _needs_summary_wizard(text: str) -> bool:
-    """ENHANCEMENT: Only trigger wizard if vague + summary keyword"""
-    return _is_summaryish(text) and not _has_specific_topic(text)
+    t = text.lower()
+    if _is_summaryish(t) and _has_time_context(t) and not _has_specific_topic(t):
+        return True
+    if _is_summaryish(t) and not _has_specific_topic(t) and not _has_time_context(t):
+        return True
+    return False
 
 def _handle_summary_wizard() -> Optional[str]:
-    """
-    Returns a rewritten analytic question string, or None if user cancels.
-    """
     print("\n🧾 Summary mode — I can summarize a period, but I need 2 things:")
     print("1) Topic: trips / fares / tips / vendors")
-    print("2) Period: e.g., summer 2022, Q2 2022, November 2022, or 2022-01-01 to 2022-02-01\n")
-
-    topic = _prompt_choice("Topic (trips/fares/tips/vendors)", ["trips", "fares", "tips", "vendors"], default="trips")
+    print("2) Period: e.g., summer 2022, Q2 2022, November 2022\n")
+    
+    topic = _prompt_choice("Topic (trips/fares/tips/vendors)", 
+                          ["trips", "fares", "tips", "vendors"], default="trips")
     period = input("Period (example: summer 2022): ").strip()
     if not period:
-        print("  ⚠️  Please provide a period (like 'summer 2022' or '2022-01-01 to 2022-02-01').\n")
+        print("  ⚠️  Please provide a period.\n")
         return None
-
-    gran = "monthly"
-
+    
     if topic == "trips":
-        return f"show trips in {period} by {gran}"
+        return f"show trips in {period} by monthly"
     if topic == "vendors":
         return f"which vendors were inactive in {period}"
     
@@ -684,200 +818,363 @@ def _handle_summary_wizard() -> Optional[str]:
     print("  - avg   = average per trip")
     print("  - total = total sum in the period")
     metric = _prompt_choice("Metric (avg/total)", ["avg", "total"], default="avg")
+    
     if topic == "fares":
-        return f"show {metric} fares in {period} by {gran}"
-    return f"show {metric} tips in {period} by {gran}"
+        return f"show {metric} fares in {period} by monthly"
+    return f"show {metric} tips in {period} by monthly"
 
 def contextual_help(user_input: str) -> None:
-    """ENHANCEMENT: Context-aware help"""
     t = user_input.lower()
-    
     if "date" in t or "when" in t:
         print("\n📅 Date format: YYYY-MM-DD (example: 2022-06-15)")
-        print("Shortcuts:")
-        print("  • 'summer 2022' = June-August")
-        print("  • 'Q2 2022' = April-June")
-        print("  • 'November 2022' = full month\n")
+        print("Shortcuts: 'summer 2022', 'Q2 2022', 'November 2022'\n")
     elif "granularity" in t:
-        print("\n📊 Granularity = time bucket size:")
-        print("  • daily   = one row per day")
-        print("  • weekly  = one row per week")
-        print("  • monthly = one row per month")
-        print("Use finer granularity for short periods.\n")
+        print("\n📊 Granularity options: daily, weekly, monthly\n")
     elif "metric" in t:
-        print("\n💰 Metric = how to aggregate money:")
-        print("  • avg   = average per trip (e.g., $15.23/trip)")
-        print("  • total = sum over all trips (e.g., $50,000 total)")
-        print("Use 'total' to see revenue, 'avg' to see typical amounts.\n")
+        print("\n💰 Metric options: avg (average per trip), total (sum)\n")
     else:
         print("\n" + HELP_TEXT + "\n")
 
-def _handle_meta_or_guidance(user_input: str) -> Optional[str]:
-    """
-    Returns:
-    - a rewritten analytic question (string) if we should continue
-    - "" if handled fully
-    - None if not a meta/guidance input
-    """
-    t = user_input.strip().lower()
-
-    if t == "help" or "help" in t:
-        contextual_help(user_input)
+# =============================================================================
+# Numbered follow-up handling
+# =============================================================================
+def _handle_numbered_followup(num_str: str) -> Optional[str]:
+    try:
+        num = int(num_str)
+    except ValueError:
+        return None
+    
+    suggestions = session_state.get("_last_suggestions", [])
+    context = session_state.get("_last_query_context")
+    current_query = session_state.get("_query_count", 0)
+    
+    # Check if context exists and is fresh
+    if not suggestions or not context:
+        print("\n❓ No previous query to follow up on.")
+        print("Try asking a question first, like: 'show trips in January 2022 by week'\n")
         return ""
-
-    if HELPISH_RE.search(t):
-        print("\nHi! I'm Symbiote Lite. I help you analyze NYC Yellow Taxi trips in 2022.\n")
-        print("Try: \"show trips from 2022-01-01 to 2022-02-01 by day\"")
-        print("Or type 'help' for examples.\n")
+    
+    # Check if context is stale (more than 1 query ago)
+    context_query = context.get("query_num", 0)
+    if current_query - context_query > 1:
+        print("\n❓ The previous suggestions are no longer valid.")
+        print("Please ask a new question or run a query first.\n")
         return ""
-
-    # ENHANCEMENT: Only trigger wizard if truly vague
-    if _needs_summary_wizard(t):
-        rewritten = _handle_summary_wizard()
-        return rewritten if rewritten else ""
-
-    return None
-
-def _clarify_busier() -> str:
-    print("\n❓ Quick clarification:")
-    print("When you say *busier*, do you mean:")
-    print("  1) Number of trips")
-    print("  2) Total fares")
-    print("  3) Average fare")
-    while True:
-        raw = input("Choose 1/2/3: ").strip()
-        if raw == "1":
-            return "trip_frequency"
-        if raw == "2":
-            session_state["metric"] = "total"
-            return "fare_trend"
-        if raw == "3":
-            session_state["metric"] = "avg"
-            return "fare_trend"
-        print("  ⚠️  Choose 1, 2, or 3.")
+    
+    if num < 1 or num > len(suggestions):
+        print(f"  ⚠️  Please choose a number between 1 and {len(suggestions)}.\n")
+        return ""
+    
+    suggestion = suggestions[num - 1]
+    last_intent = context.get("intent")
+    sd, ed = context.get("start_date"), context.get("end_date")
+    gran = context.get("granularity", "monthly")
+    
+    # Handle each suggestion type
+    if "Compare this to another period" in suggestion:
+        print("\n📅 To compare periods, specify a new date range.")
+        print("Example: 'show trips in Q1 2022 by month'\n")
+        return ""
+    
+    if "vendors" in suggestion.lower() and last_intent == "trip_frequency":
+        if sd and ed:
+            return f"show inactive vendors from {_date_to_str(sd)} to {_date_to_str(ed)}"
+    
+    if "fare" in suggestion.lower():
+        if sd and ed:
+            return f"show avg fares from {_date_to_str(sd)} to {_date_to_str(ed)} by {gran}"
+    
+    if "tip" in suggestion.lower():
+        if sd and ed:
+            return f"show avg tips from {_date_to_str(sd)} to {_date_to_str(ed)} by {gran}"
+    
+    if "trip" in suggestion.lower() and last_intent == "vendor_inactivity":
+        if sd and ed:
+            return f"show trips from {_date_to_str(sd)} to {_date_to_str(ed)} by monthly"
+    
+    if "Compare vendor" in suggestion:
+        print("\n📊 To compare vendors across quarters, try:")
+        print("   'show inactive vendors in Q1 2022'\n")
+        return ""
+    
+    print(f"\n💡 Selected: {suggestion}")
+    print("Please rephrase this as a question.\n")
+    return ""
 
 # =============================================================================
-# CLI loop
+# Vague time handling
+# =============================================================================
+def _is_vague_time_only(text: str) -> bool:
+    t = text.lower()
+    vague = ["last month", "this month", "yesterday", "today", "last week", 
+             "this week", "recently", "lately"]
+    return any(v in t for v in vague) and not _has_time_context(t)
+
+def _handle_vague_time_reference(user_input: str) -> Optional[str]:
+    t = user_input.lower()
+    if not _is_vague_time_only(t):
+        return None
+    
+    patterns = [
+        ("last month", "❓ 'Last month' is ambiguous for this 2022 dataset."),
+        ("this month", "❓ 'This month' is ambiguous for this 2022 dataset."),
+        ("yesterday", "❓ 'Yesterday' is ambiguous for this 2022 dataset."),
+        ("today", "❓ 'Today' is ambiguous for this 2022 dataset."),
+        ("last week", "❓ 'Last week' is ambiguous for this 2022 dataset."),
+        ("this week", "❓ 'This week' is ambiguous for this 2022 dataset."),
+        ("recently", "❓ 'Recently' is ambiguous for this 2022 dataset."),
+        ("lately", "❓ 'Lately' is ambiguous for this 2022 dataset."),
+    ]
+    
+    for pattern, msg in patterns:
+        if pattern in t:
+            print(f"\n{msg}")
+            print("Try: 'show trips in November 2022' or 'fares in Q4 2022'\n")
+            return ""
+    return None
+
+# =============================================================================
+# Main meta/guidance handler
+# =============================================================================
+def _handle_meta_or_guidance(user_input: str) -> Optional[str]:
+    t = user_input.strip()
+    t_lower = t.lower()
+    
+    # Numbered follow-up
+    if t.isdigit():
+        return _handle_numbered_followup(t)
+    
+    # Help command
+    if t_lower == "help":
+        contextual_help(user_input)
+        return ""
+    
+    # Help-ish questions
+    if HELPISH_RE.search(t_lower):
+        print("\nI can help with NYC taxi data in 2022.")
+        print("Topics: trips, fares, tips, vendors")
+        print("Type 'help' for examples.\n")
+        return ""
+    
+    # Greetings
+    greetings = ["hey", "hi ", "hi,", "hello", "i'm new", "what can you do", 
+                 "good morning", "good afternoon", "good evening"]
+    if any(g in t_lower for g in greetings):
+        print("\nI can help with NYC taxi data in 2022.")
+        print("Topics: trips, fares, tips, vendors")
+        print("Type 'help' for examples.\n")
+        return ""
+    
+    # Vague time references
+    vague = _handle_vague_time_reference(user_input)
+    if vague is not None:
+        return vague
+    
+    # Unsupported queries (check BEFORE summary wizard)
+    unsupported = detect_unsupported_query(user_input)
+    if unsupported:
+        print(f"\n{unsupported}")
+        print("\nTry: 'show trips in summer 2022 by week'\n")
+        return ""
+    
+    # Summary wizard
+    if _needs_summary_wizard(t_lower):
+        rewritten = _handle_summary_wizard()
+        return rewritten if rewritten else ""
+    
+    return None
+
+# =============================================================================
+# Busier clarification
+# =============================================================================
+def _clarify_busier() -> Tuple[str, bool]:
+    print("\n❓ Quick clarification:")
+    print("When you say *busier*, do you mean:")
+    print("  1) Number of trips (more rides = busier)")
+    print("  2) Total revenue (more money = busier)")
+    print("  3) Average fare per trip")
+    while True:
+        try:
+            raw = input("Choose 1/2/3: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n")
+            return ("trip_frequency", False)
+        if raw == "1":
+            return ("trip_frequency", True)
+        if raw == "2":
+            session_state["metric"] = "total"
+            return ("fare_trend", True)
+        if raw == "3":
+            session_state["metric"] = "avg"
+            return ("fare_trend", True)
+        print("  ⚠️  Choose 1, 2, or 3.")
+
+def _needs_busier_clarification(user_input: str) -> bool:
+    t = user_input.lower()
+    busy = ["busier", "busy", "more active", "less active", "quieter", "slower"]
+    comparison = ["vs", "versus", "compared", "than", "or"]
+    return any(b in t for b in busy) and any(c in t for c in comparison)
+
+# =============================================================================
+# Multi-topic handler
+# =============================================================================
+def _handle_multi_topic(topics: List[str]) -> str:
+    print(f"\n❓ I noticed you mentioned multiple topics: {', '.join(topics)}")
+    print("I can only analyze one at a time. Which would you like?\n")
+    for i, topic in enumerate(topics, 1):
+        print(f"  {i}) {topic}")
+    while True:
+        try:
+            raw = input(f"Choose 1-{len(topics)}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n")
+            return topics[0]
+        try:
+            num = int(raw)
+            if 1 <= num <= len(topics):
+                return topics[num - 1]
+        except ValueError:
+            pass
+        print(f"  ⚠️  Choose 1-{len(topics)}.")
+
+# =============================================================================
+# Main agent loop
 # =============================================================================
 def run_agent():
     global session_state
-
+    
     print("\n" + INTRO + "\n")
-
+    
     # Show mode
     if os.getenv("OPENAI_API_KEY"):
         if MODEL is None:
-            print("⚠️  OPENAI_API_KEY is set, but OpenAI client/model is not available. Falling back to deterministic mode.\n")
+            print("⚠️  OPENAI_API_KEY set but client unavailable. Using deterministic mode.\n")
         else:
             print("✅ ChatGPT routing is enabled (OpenAI).\n")
     else:
-        print("ℹ️  ChatGPT routing is OFF (no OPENAI_API_KEY). Using deterministic mode.\n")
-
-    # ENHANCEMENT: First-time user hint
-    if not os.path.exists(".symbiote_history"):
-        print("👋 First time here? Try: \"show trips in January 2022 by week\"\n")
-        try:
-            with open(".symbiote_history", "w") as f:
-                f.write("visited")
-        except Exception:
-            pass
-
+        print("ℹ️  ChatGPT routing OFF. Using deterministic mode.\n")
+    
+    print('👋 First time here? Try: "show trips in January 2022 by week"\n')
+    
     while True:
-        q = input("Ask a question: ").strip()
+        try:
+            q = input("Ask a question: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n👋 Goodbye!\n")
+            break
+        
         if not q:
             continue
-
-        if q.lower() in ("exit", "quit"):
+        
+        if q.lower() in ("exit", "quit", "bye", "q"):
+            print("\n👋 Goodbye!\n")
             break
+        
         if q.lower() == "reset":
             session_state = reset_session()
             print("Session reset.\n")
             continue
-
-        # Meta/guidance & summary wizard first
+        
+        # Security: SQL injection
+        if detect_sql_injection(q):
+            print("\n🚫 That looks like a SQL injection attempt.")
+            print("I only run safe, pre-built SELECT queries.\n")
+            continue
+        
+        # Meta/guidance handling
         meta = _handle_meta_or_guidance(q)
         if meta is not None:
             if meta == "":
                 continue
-            else:
-                q = meta
-
-        # Reset per analytic turn
+            q = meta
+        
+        # Multi-topic detection
+        multi = detect_multi_topic(q)
+        if multi:
+            chosen = _handle_multi_topic(multi)
+            # Simplify query to chosen topic
+            q = re.sub(r'\b(trip|trips|ride|rides|fare|fares|tip|tips|vendor|vendors)\b', 
+                      '', q, flags=re.I)
+            q = q.strip() + f" {chosen}"
+        
+        # Preserve context for follow-ups
+        last_suggestions = session_state.get("_last_suggestions", [])
+        last_context = session_state.get("_last_query_context")
+        query_count = session_state.get("_query_count", 0)
+        
         session_state = reset_session()
-
-        # Semantic rewrite (optional)
+        session_state["_last_suggestions"] = last_suggestions
+        session_state["_last_query_context"] = last_context
+        session_state["_query_count"] = query_count
+        
+        # Busier clarification
+        needs_busier = _needs_busier_clarification(q)
+        
+        # Semantic rewrite
         rewrite = semantic_rewrite(q)
         rewritten = (rewrite.get("rewritten") or q).strip()
-
-        # ENHANCEMENT: Use LLM hints to pre-fill slots
-        gh = rewrite.get("granularity_hint")
-        if gh and gh in ("daily", "weekly", "monthly"):
-            session_state["granularity"] = gh
         
-        mh = rewrite.get("metric_hint")
-        if mh and mh in ("avg", "total"):
-            session_state["metric"] = mh
-
-        # Deterministic extraction (adds to LLM hints)
+        # Apply LLM hints
+        if rewrite.get("granularity_hint") in ("daily", "weekly", "monthly"):
+            session_state["granularity"] = rewrite["granularity_hint"]
+        if rewrite.get("metric_hint") in ("avg", "total"):
+            session_state["metric"] = rewrite["metric_hint"]
+        
+        # Extract slots
         extract_slots_from_text(rewritten)
-
-        # ENHANCEMENT: If invalid dates detected, force clean re-entry
+        
+        # Handle invalid dates
         if session_state.get("_saw_invalid_iso_date"):
             print("  Let's enter valid dates.\n")
             session_state["start_date"] = None
             session_state["end_date"] = None
-
+        
         # Route
         route = ask_gemini_router(rewritten)
         if not route.get("dataset_match", True):
-            print("\n❌ Out of scope for this dataset (NYC Yellow Taxi 2022).")
-            print("Try asking about trips/fares/tips/vendors in 2022.\n")
+            print("\n❌ Out of scope (NYC Yellow Taxi 2022 only).")
+            print("Try: trips, fares, tips, or vendors in 2022.\n")
             continue
-
+        
         intent = route.get("intent", "unknown")
-        if intent not in SUPPORTED_INTENTS:
-            if "busier" in q.lower() or "busy" in q.lower():
-                intent = _clarify_busier()
-            else:
-                print("\n❓ I can help with trip analysis, fare analysis, tip analysis, or vendor analysis.")
-                print("Try: \"show trips in January 2022 by week\" or type 'help' for examples.\n")
+        
+        # Busier handling
+        if needs_busier:
+            intent, ok = _clarify_busier()
+            if not ok:
                 continue
-
+        elif intent not in SUPPORTED_INTENTS:
+            print("\n❓ I can help with: trips, fares, tips, or vendors.")
+            print('Try: "show trips in January 2022 by week"\n')
+            continue
+        
         session_state["intent"] = intent
-
-        # Prompt missing slots
+        
+        # Fill missing slots
         for slot in missing_slots(intent):
             if slot == "start_date":
                 session_state["start_date"] = _prompt_date("start_date", "2022-06-01")
             elif slot == "end_date":
                 session_state["end_date"] = _prompt_date("end_date", "2022-09-01")
             elif slot == "granularity":
-                # ENHANCEMENT: Smart default
                 if session_state["start_date"] and session_state["end_date"]:
                     suggestion = recommend_granularity(
-                        session_state["start_date"],
-                        session_state["end_date"]
-                    )
+                        session_state["start_date"], session_state["end_date"])
                     days = (session_state["end_date"] - session_state["start_date"]).days
                     print(f"\n💡 For a {days}-day range, '{suggestion}' often works well.")
                 else:
                     suggestion = "weekly"
-                
                 session_state["granularity"] = _prompt_choice(
                     "granularity (daily/weekly/monthly)",
                     ["daily", "weekly", "monthly"],
-                    default=suggestion,
-                )
+                    default=suggestion)
             elif slot == "metric":
                 print("\nMetric controls how we aggregate money:")
                 print("  - avg   = average per trip")
                 print("  - total = total sum in the period")
                 session_state["metric"] = _prompt_choice(
-                    "metric (avg/total)",
-                    ["avg", "total"],
-                    default="avg",
-                )
-
+                    "metric (avg/total)", ["avg", "total"], default="avg")
+        
         # Validate dates
         try:
             validate_dates_state()
@@ -891,13 +1188,13 @@ def run_agent():
             except Exception as e2:
                 print(f"\n  ⚠️  {e2}\nCancelled.\n")
                 continue
-
-        # ENHANCEMENT: Final validation
+        
+        # Final validation
         if not validate_all_slots():
-            print("Cannot proceed. Please try again.\n")
+            print("Cannot proceed. Try again.\n")
             continue
-
-        # ENHANCEMENT: Warn about very long daily ranges
+        
+        # Warn about large daily queries
         if session_state.get("granularity") == "daily":
             days = (session_state["end_date"] - session_state["start_date"]).days
             if days > 90:
@@ -905,56 +1202,53 @@ def run_agent():
                 print("   Consider 'weekly' or 'monthly' for clearer trends.")
                 if not _prompt_yes_no("Continue with daily?"):
                     session_state["granularity"] = _prompt_choice(
-                        "Choose different granularity",
-                        ["weekly", "monthly"],
-                        default="weekly",
-                    )
-
-        # Enhanced plan display
+                        "Choose granularity", ["weekly", "monthly"], default="weekly")
+        
+        # Build and show plan
         sd = _date_to_str(session_state["start_date"])
         ed = _date_to_str(session_state["end_date"])
         gran = session_state.get("granularity")
         metric = session_state.get("metric")
-
-        what = {
+        
+        task_names = {
             "trip_frequency": "Count trips over time",
             "vendor_inactivity": "Rank vendors by trip count (lowest = most inactive)",
             "fare_trend": f"{'Sum' if metric=='total' else 'Average'} fares over time",
             "tip_trend": f"{'Sum' if metric=='total' else 'Average'} tips over time",
-        }[intent]
-
-        rows = estimate_rows(intent, session_state["start_date"], session_state["end_date"], gran)
-
+        }
+        
         print("\n" + "="*60)
         print("🧠 EXECUTION PLAN")
         print("="*60)
-        print(f"📌 Task: {what}")
+        print(f"📌 Task: {task_names[intent]}")
         print(f"📅 Period: {sd} to {ed} (exclusive)")
         if gran:
             print(f"⏱️  Granularity: {gran}")
         if metric and intent in ("fare_trend", "tip_trend"):
             print(f"📊 Metric: {metric}")
+        rows = estimate_rows(intent, session_state["start_date"], 
+                            session_state["end_date"], gran)
         print(f"💾 Expected output: {rows} rows")
         print("="*60 + "\n")
-
+        
         if not _prompt_yes_no("Does this look correct?"):
             print("Cancelled.\n")
             continue
-
-        # ENHANCEMENT: SQL explanation
+        
+        # Show SQL explanation and query
         print(f"\n📊 What this query does:")
         print(f"   {explain_sql(intent)}\n")
-
+        
         sql = safe_select_only(build_sql(intent))
         print("SQL:")
         print(sql)
         print()
-
+        
         if not _prompt_yes_no("Run query?"):
             print("Cancelled.\n")
             continue
-
-        # Execute with error handling
+        
+        # Execute
         print("⏳ Running query...")
         try:
             df = execute_sql_query(sql)
@@ -963,23 +1257,22 @@ def run_agent():
             print(f"\n❌ Query failed: {e}")
             print("This might be a bug — please report it.\n")
             continue
-
-        # ENHANCEMENT: Handle empty results
+        
+        # Handle results
         if len(df) == 0:
             print("⚠️  Query returned 0 rows.")
             print("Possible reasons:")
-            print("  • Date range has no data in the dataset")
-            print("  • Try expanding the date range")
-            print("  • Verify dates are in 2022\n")
+            print("  • Date range has no data")
+            print("  • Try expanding the date range\n")
             continue
-
-        print(df.head(20))  # Show more rows
+        
+        # Show results
+        print(df.head(20))
         print(f"\nDone. Returned {len(df)} rows.\n")
-
-        # ENHANCEMENT: Follow-up suggestions
+        
+        # Update query count and suggest follow-ups
+        session_state["_query_count"] = query_count + 1
         suggest_followup(intent)
-
-        session_state = reset_session()
 
 if __name__ == "__main__":
     run_agent()
