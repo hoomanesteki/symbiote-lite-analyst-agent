@@ -99,22 +99,48 @@ symbiote-lite-analyst-agent/
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
+
+### Option 1: Using Make (Recommended)
 
 ```bash
-# Setup
+# Clone the repository
+git clone https://github.com/hoomanesteki/symbiote-lite-analyst-agent.git
+cd symbiote-lite-analyst-agent
+
+# Full setup (install deps + create database)
 make setup
 
-# Run
+# Run the agent
 make run
 ```
 
-Or manually:
+### Option 2: Manual Setup
+
 ```bash
+# Create conda environment
 conda env create -f environment.yml
 conda activate symbiote-lite
+
+# Or using pip
+pip install pandas numpy python-dotenv mcp openai pytest
+
+# Create sample database
 python -m scripts.create_sample_db
+
+# Run the agent
 python -m scripts.run_agent
+```
+
+### Option 3: Using Docker
+
+```bash
+# Build and run
+make docker-build
+make docker-run
+
+# Or with docker-compose
+docker-compose up agent
 ```
 
 ---
