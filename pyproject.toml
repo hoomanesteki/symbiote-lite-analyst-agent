@@ -1,13 +1,102 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "symbiote-lite"
 version = "0.1.0"
-description = "Symbiote Lite — Human-in-the-Loop Analyst Agent"
+description = "Human-in-the-Loop Analyst Agent with MCP Integration"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
-dependencies = ["pandas", "python-dotenv", "openai"]
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = [
+    "ai",
+    "agent",
+    "mcp",
+    "human-in-the-loop",
+    "analytics",
+    "sql",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "python-dotenv>=1.0",
+    "mcp>=1.0",
+]
 
-[tool.setuptools]
-packages = ["symbiote_lite"]
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "mypy>=1.0",
+    "ruff>=0.1.0",
+]
+openai = [
+    "openai>=1.0",
+]
+all = [
+    "symbiote-lite[dev,openai]",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/symbiote-lite-analyst-agent"
+Repository = "https://github.com/yourusername/symbiote-lite-analyst-agent"
+Issues = "https://github.com/yourusername/symbiote-lite-analyst-agent/issues"
+
+[project.scripts]
+symbiote-lite = "scripts.run_agent:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["symbiote_lite*", "scripts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # do not perform function calls in argument defaults
+]
+
+[tool.ruff.isort]
+known-first-party = ["symbiote_lite"]

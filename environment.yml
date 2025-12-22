@@ -1,78 +1,54 @@
 name: symbiote-lite
 channels:
   - conda-forge
+  - defaults
 
 dependencies:
-  # ------------------------
-  # Python
-  # ------------------------
+  # === Python ===
   - python=3.11
 
-  # ------------------------
-  # Core data stack (compiled)
-  # ------------------------
-  - numpy>=1.26,<2.0
-  - pandas>=2.2,<3.0
-  - pyarrow>=15,<16
+  # === Core Dependencies ===
+  - pandas>=2.0
+  - numpy>=1.24
 
-  # ------------------------
-  # SQL / Data access
-  # ------------------------
-  - sqlalchemy>=2.0,<3.0
+  # === Database ===
+  # SQLite is included with Python stdlib - no separate package needed
 
-  # ------------------------
-  # Google BigQuery
-  # ------------------------
-  - google-cloud-bigquery>=3.17,<4.0
-  - google-auth>=2.29,<3.0
+  # === Environment Management ===
+  - python-dotenv>=1.0
 
-  # ------------------------
-  # Visualization
-  # ------------------------
-  - altair>=5.2,<6.0
-  - matplotlib>=3.8,<4.0
-  - seaborn>=0.13,<0.14
+  # === HTTP/Async (for MCP) ===
+  - httpx>=0.27
+  - anyio>=4.0
 
-  # ------------------------
-  # Machine Learning
-  # ------------------------
-  - scikit-learn>=1.4,<1.5
+  # === Development & Testing ===
+  - pytest>=7.0
+  - pytest-cov>=4.0
 
-  # ------------------------
-  # App / UI
-  # ------------------------
-  - streamlit>=1.33,<2.0
+  # === Reproducibility Tooling ===
+  - conda-lock>=4.0
 
-  # ------------------------
-  # Utilities
-  # ------------------------
-  - pydantic>=2.6,<3.0
-  - python-dotenv>=1.0,<2.0
+  # === Optional: OpenAI Integration ===
+  # Installed via pip for latest version
 
-  # ------------------------
-  # Testing
-  # ------------------------
-  - pytest>=8.1,<9.0
-
-  # ------------------------
-  # Pip bootstrap
-  # ------------------------
+  # === Pip Dependencies ===
   - pip
-
-  # ------------------------
-  # Pip-only (pure Python, cross-platform)
-  # ------------------------
   - pip:
-      # LLM APIs
-      - openai>=1.40.0
+      # MCP SDK (Model Context Protocol)
+      - mcp>=1.0
 
-      # MCP (Model Context Protocol)
-      - mcp>=1.0.0
-      - httpx>=0.27.0
+      # OpenAI (optional - for LLM routing)
+      - openai>=1.0
 
-      # Notebook helpers
-      - ipython-sql>=0.5.0
-      - db-dtypes>=1.2.0
+      # Type checking (development)
+      - mypy>=1.0
 
-      # Altair helpers
-      - altair_ally>=0.1.0
+# === Platform Notes ===
+# This environment is tested on:
+# - macOS (Apple Silicon & Intel)
+# - Linux (Ubuntu 22.04+)
+# - Windows 10/11
+#
+# To create: conda env create -f environment.yml
+# To update: conda env update -f environment.yml --prune
+# To lock:   conda-lock -f environment.yml -p osx-64 -p osx-arm64 -p linux-64 -p win-64

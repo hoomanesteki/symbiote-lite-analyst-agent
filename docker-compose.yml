@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  # Interactive Agent
+  agent:
+    build: .
+    container_name: symbiote-lite-agent
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./data:/app/data
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - SYMBIOTE_DB_PATH=/app/data/taxi_trips.sqlite
+    command: python -m scripts.run_agent
+
+  # MCP Server (for external clients)
+  mcp-server:
+    build: .
+    container_name: symbiote-lite-mcp
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - SYMBIOTE_DB_PATH=/app/data/taxi_trips.sqlite
+    command: python -m scripts.mcp_server
+
+  # Test runner
+  test:
+    build: .
+    container_name: symbiote-lite-test
+    volumes:
+      - ./data:/app/data
+      - ./tests:/app/tests
+    environment:
+      - SYMBIOTE_DB_PATH=/app/data/taxi_trips.sqlite
+    command: python -m pytest -v
+    profiles:
+      - test
+
+# Usage:
+# ------
+# Interactive agent:  docker-compose run agent
+# MCP server:         docker-compose up mcp-server
+# Run tests:          docker-compose --profile test run test
+# Build only:         docker-compose build
