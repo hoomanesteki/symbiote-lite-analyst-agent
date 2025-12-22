@@ -178,7 +178,7 @@ symbiote-lite-analyst-agent/
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/symbiote-lite-analyst-agent.git
+git clone https://github.com/hoomanesteki/symbiote-lite-analyst-agent.git
 cd symbiote-lite-analyst-agent
 
 # Full setup (install deps + create database)
@@ -524,7 +524,7 @@ make docker-build   # Build container
 | numpy | Numerical operations |
 | python-dotenv | Environment management |
 | mcp | Model Context Protocol |
-| openai | LLM routing (optional) |
+| openai | LLM routing |
 | pytest | Testing |
 
 ---
@@ -539,6 +539,6 @@ MIT License — See [LICENSE](LICENSE)
 
 **Symbiote Lite** — Agentic AI analyst with human-in-the-loop control and MCP integration.
 
-[Report Bug](https://github.com/yourusername/symbiote-lite-analyst-agent/issues) · [Request Feature](https://github.com/yourusername/symbiote-lite-analyst-agent/issues)
+[Report Bug](https://github.com/hoomanesteki/symbiote-lite-analyst-agent/issues) · [Request Feature](https://github.com/hoomanesteki/symbiote-lite-analyst-agent/issues)
 
 </div>
