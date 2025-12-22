@@ -19,9 +19,9 @@ You approve → query runs → results + explanation
 ```
 
 Key behaviors:
-- **Never executes without approval** — always asks first
-- **SELECT only** — can't modify data
-- **Detects ambiguity** — asks clarifying questions instead of guessing
+- **Never executes without approval:** always asks first
+- **SELECT only:** can't modify data
+- **Detects ambiguity:** asks clarifying questions instead of guessing
 
 ---
 
