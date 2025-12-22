@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "symbiote-lite"
+version = "0.1.0"
+description = "Symbiote Lite — Human-in-the-Loop Analyst Agent"
+requires-python = ">=3.10"
+dependencies = ["pandas", "python-dotenv", "openai"]
+
+[tool.setuptools]
+packages = ["symbiote_lite"]

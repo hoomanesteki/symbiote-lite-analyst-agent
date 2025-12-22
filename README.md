@@ -1,9 +1,17 @@
-# symbiote-lite-analyst-agent
-A lightweight human-in-the-loop AI agent that augments analyst workflows through guided reasoning, synthesis, and decision support.
+# Symbiote Lite — Human-in-the-Loop Analyst Agent
 
+## Run
+```bash
+python -m scripts.run_agent
+```
 
-## Data Source
+## Database
+By default the agent expects a SQLite DB at:
+- `./data/taxi_trips.sqlite`
 
-This project uses Google BigQuery public datasets.
-Initial analysis is based on the NYC Yellow Taxi Trips dataset
-(`bigquery-public-data.new_york_taxi_trips`).
+Or set:
+- `SYMBIOTE_DB_PATH=/absolute/path/to/taxi_trips.sqlite`
+
+## Environment (optional)
+- `OPENAI_API_KEY` enables OpenAI routing/rewrite
+- `SYMBIOTE_MODEL` sets model name (default: gpt-4)
