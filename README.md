@@ -197,15 +197,6 @@ make test-fast     # skip slow ones
 
 ---
 
-## Docker
-
-```bash
-make docker-build
-make docker-run
-```
-
----
-
 ## License
 
 MIT
