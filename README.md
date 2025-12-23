@@ -180,12 +180,12 @@ Then open **http://localhost:7860** in your browser.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  🔬 Symbiote Lite Analyst Agent                         │
+│   Symbiote Lite Analyst Agent                           │
 │  ───────────────────────────────────────────────────    │
 │                                                         │
 │  You: show trips in January 2022 by week                │
 │                                                         │
-│  Agent: 🧠 EXECUTION PLAN                               │
+│  Agent:  EXECUTION PLAN                                 │
 │         Task: Count trips over time                     │
 │         Period: 2022-01-01 to 2022-02-01                │
 │         Granularity: weekly                             │
@@ -194,7 +194,7 @@ Then open **http://localhost:7860** in your browser.
 │                                                         │
 │  You: yes                                               │
 │                                                         │
-│  Agent: ✅ Query Results                                │
+│  Agent:  Query Results                                  │
 │         | week    | trips |                             │
 │         |---------|-------|                             │
 │         | 2022-00 | 170   |                             │
