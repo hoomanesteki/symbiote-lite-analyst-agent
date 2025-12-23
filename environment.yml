@@ -43,6 +43,10 @@ dependencies:
       # Type checking (development)
       - mypy>=1.0
 
+      # Gradio Web UI
+      - gradio>=4.0
+      - tabulate>=0.9
+
 # === Platform Notes ===
 # This environment is tested on:
 # - macOS (Apple Silicon & Intel)

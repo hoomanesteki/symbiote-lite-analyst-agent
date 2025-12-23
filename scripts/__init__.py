@@ -1,1 +1,1 @@
-# Scripts package
+# Scripts module

@@ -5,7 +5,7 @@
 # Run 'make help' to see all available commands
 # ============================================================
 
-.PHONY: help install install-dev setup clean test test-cov test-mcp lint format typecheck run server db docker-build docker-run docker-test docker-clean all
+.PHONY: help install install-dev setup clean test test-cov test-mcp lint format typecheck run run-ui run-ui-public server db docker-build docker-run docker-test docker-clean all
 
 # Default target
 .DEFAULT_GOAL := help
@@ -50,7 +50,7 @@ install: ## Install production dependencies
 
 install-dev: ## Install development dependencies
 	@echo "$(BLUE)Installing development dependencies...$(NC)"
-	$(PIP) install pandas numpy python-dotenv mcp openai pytest pytest-cov mypy ruff
+	$(PIP) install pandas numpy python-dotenv mcp openai pytest pytest-cov mypy ruff gradio tabulate
 
 install-all: install install-dev ## Install all dependencies
 	@echo "$(GREEN)All dependencies installed!$(NC)"
@@ -91,9 +91,19 @@ db-reset: db-clean db ## Reset database (delete and recreate)
 # ============================================================
 # Running the Application
 # ============================================================
-run: ## Run the interactive agent
-	@echo "$(BLUE)Starting Symbiote Lite Agent...$(NC)"
+run: ## Run the interactive CLI agent
+	@echo "$(BLUE)Starting Symbiote Lite Agent (CLI)...$(NC)"
 	$(PYTHON) -m scripts.run_agent
+
+run-ui: ## Run the Gradio web UI (http://localhost:7860)
+	@echo "$(BLUE)Starting Symbiote Lite Web UI...$(NC)"
+	@$(PIP) install gradio tabulate -q 2>/dev/null || true
+	$(PYTHON) -m scripts.gradio_app
+
+run-ui-public: ## Run Gradio web UI with public shareable URL
+	@echo "$(BLUE)Starting Symbiote Lite Web UI (public)...$(NC)"
+	@$(PIP) install gradio tabulate -q 2>/dev/null || true
+	$(PYTHON) -c "from scripts.gradio_app import create_interface; demo = create_interface(); demo.launch(share=True, server_name='0.0.0.0')"
 
 server: ## Start the MCP server
 	@echo "$(BLUE)Starting MCP Server...$(NC)"
@@ -158,6 +168,14 @@ docker-run: ## Run agent in Docker container
 		-v $(PWD)/data:/app/data \
 		$(DOCKER_IMAGE):$(DOCKER_TAG)
 
+docker-ui: ## Run Gradio web UI in Docker container
+	@echo "$(BLUE)Running Gradio UI in Docker...$(NC)"
+	$(DOCKER) run -it --rm \
+		-p 7860:7860 \
+		-v $(PWD)/data:/app/data \
+		$(DOCKER_IMAGE):$(DOCKER_TAG) \
+		python -m scripts.gradio_app
+
 docker-server: ## Run MCP server in Docker container
 	@echo "$(BLUE)Running MCP server in Docker...$(NC)"
 	$(DOCKER) run -it --rm \
@@ -199,6 +217,10 @@ dc-logs: ## View docker-compose logs
 dc-build: ## Build with docker-compose
 	@echo "$(BLUE)Building with docker-compose...$(NC)"
 	$(DOCKER_COMPOSE) build
+
+dc-ui: ## Start Gradio UI with docker-compose
+	@echo "$(BLUE)Starting Gradio UI via docker-compose...$(NC)"
+	$(DOCKER_COMPOSE) up gradio-ui
 
 # ============================================================
 # Cleaning

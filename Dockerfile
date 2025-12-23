@@ -15,10 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml .
 COPY README.md .
 
-# Install dependencies
+# Install dependencies (including gradio for web UI)
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir build && \
-    pip install --no-cache-dir pandas numpy python-dotenv mcp openai pytest
+    pip install --no-cache-dir pandas numpy python-dotenv mcp openai pytest gradio tabulate
 
 # --- Runtime Stage ---
 FROM python:3.11-slim as runtime
@@ -48,9 +48,14 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONPATH=/app
 
+# Expose port for Gradio UI
+EXPOSE 7860
+
 # Default command - run the interactive agent
 CMD ["python", "-m", "scripts.run_agent"]
 
 # --- Alternative entry points ---
-# MCP Server: docker run -p 8000:8000 symbiote-lite python -m scripts.mcp_server
-# Tests:      docker run symbiote-lite python -m pytest
+# CLI Agent:   docker run -it symbiote-lite
+# Gradio UI:   docker run -p 7860:7860 symbiote-lite python -m scripts.gradio_app
+# MCP Server:  docker run -p 8000:8000 symbiote-lite python -m scripts.mcp_server
+# Tests:       docker run symbiote-lite python -m pytest

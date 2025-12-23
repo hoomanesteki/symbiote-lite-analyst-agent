@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # Interactive Agent
+  # Interactive CLI Agent
   agent:
     build: .
     container_name: symbiote-lite-agent
@@ -13,6 +13,19 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - SYMBIOTE_DB_PATH=/app/data/taxi_trips.sqlite
     command: python -m scripts.run_agent
+
+  # Gradio Web UI
+  gradio-ui:
+    build: .
+    container_name: symbiote-lite-ui
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - SYMBIOTE_DB_PATH=/app/data/taxi_trips.sqlite
+    command: python -m scripts.gradio_app
 
   # MCP Server (for external clients)
   mcp-server:
@@ -42,7 +55,8 @@ services:
 
 # Usage:
 # ------
-# Interactive agent:  docker-compose run agent
-# MCP server:         docker-compose up mcp-server
-# Run tests:          docker-compose --profile test run test
-# Build only:         docker-compose build
+# Interactive CLI agent:  docker-compose run agent
+# Gradio Web UI:          docker-compose up gradio-ui     → http://localhost:7860
+# MCP server:             docker-compose up mcp-server    → http://localhost:8000
+# Run tests:              docker-compose --profile test run test
+# Build only:             docker-compose build
